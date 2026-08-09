@@ -1,6 +1,8 @@
-"""Worker execution module: build execute_command, track live running time, listen for 'k' key kill."""
+"""Worker execution module: build execute_command, track live running time, listen for 'k' key kill and connection loss."""
 
+import select
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -37,15 +39,40 @@ def format_elapsed_time(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def force_stop_process(process: subprocess.Popen) -> None:
+    """Force stop a running execution process (SIGTERM then SIGKILL)."""
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1.0)
+
+
+def check_socket_connection_lost(connection: socket.socket) -> bool:
+    """Check if the control socket connection to the master node has been lost/closed."""
+    try:
+        rlist, _, _ = select.select([connection], [], [], 0.0)
+        if rlist:
+            data = connection.recv(1024, socket.MSG_PEEK)
+            if not data:
+                return True
+    except (OSError, ConnectionError):
+        return True
+    return False
+
+
 def run_execute_command(
     execute_command_template: str,
     input_file: str,
     output_directory: str = WORKER_OUTPUT_DIRECTORY,
     output_file: str | None = None,
+    connection: socket.socket | None = None,
     simulate_failure_after: float | None = None,
     progress_callback: Callable[[float], None] | None = None,
 ) -> float:
-    """Run execute_command on worker, show live progress executing with elapsed time, support 'k' kill."""
+    """Run execute_command on worker, show live progress executing with elapsed time, support 'k' kill and connection loss force-stop."""
     Path(output_directory).mkdir(parents=True, exist_ok=True)
     resolved_command = build_execute_command(
         execute_command_template, input_file, output_directory, output_file
@@ -61,7 +88,6 @@ def run_execute_command(
     old_settings = None
     if sys.stdin.isatty():
         try:
-            import select
             import termios
             import tty
 
@@ -97,33 +123,40 @@ def run_execute_command(
                 )
                 return elapsed_seconds
 
+            # Check if connection to master server is lost
+            if connection is not None and check_socket_connection_lost(connection):
+                sys.stdout.write("\n")
+                print("\nConnection to server lost! Force-stopping running process...")
+                force_stop_process(process)
+                raise ConnectionError("Server connection lost during task execution")
+
             # Check simulated failure timer (if set for automated tests)
             if (
                 simulate_failure_after is not None
                 and elapsed_seconds >= simulate_failure_after
             ):
                 sys.stdout.write("\n")
-                process.terminate()
-                process.wait(timeout=2)
+                print("\nSimulated failure triggered! Force-stopping process...")
+                force_stop_process(process)
                 raise KeyboardInterrupt(
                     f"Simulated failure triggered after {simulate_failure_after}s"
                 )
 
             # Check for interactive 'k' key press
             if fd is not None:
-                import select
-
                 rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
                 if rlist:
                     char = sys.stdin.read(1)
                     if char.lower() == "k":
                         sys.stdout.write("\n")
-                        print("\n'k' key pressed! Killing task and simulating node drop...")
-                        process.terminate()
-                        process.wait(timeout=2)
-                        raise KeyboardInterrupt("Task killed by user pressing 'k'")
+                        print("\n'k' key pressed! Force-killing task process and simulating node drop...")
+                        force_stop_process(process)
+                        raise KeyboardInterrupt("Task force-killed by user pressing 'k'")
 
             time.sleep(0.2)
+    except Exception:
+        force_stop_process(process)
+        raise
     finally:
         if fd is not None and old_settings is not None:
             try:

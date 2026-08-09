@@ -29,3 +29,32 @@ def request_file(
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"Failed to fetch {filename}: HTTP {exc.code}") from exc
     return str(destination_path)
+
+
+def upload_result_file(
+    master_ip_address: str,
+    file_transfer_port: int,
+    source_filepath: str,
+) -> None:
+    """Worker calls POST /file/<filename> to send its output file back to master's daemon."""
+    path = Path(source_filepath)
+    if not path.is_file():
+        raise FileNotFoundError(f"Result file to upload does not exist: {source_filepath}")
+
+    filename = path.name
+    file_bytes = path.read_bytes()
+    url = f"http://{master_ip_address}:{file_transfer_port}/file/{filename}"
+
+    request = urllib.request.Request(
+        url,
+        data=file_bytes,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            if response.status != 200:
+                raise RuntimeError(f"Failed to upload {filename}: HTTP {response.status}")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Failed to upload {filename}: HTTP {exc.code}") from exc
+

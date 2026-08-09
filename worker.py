@@ -89,6 +89,10 @@ def fetch_allocated_part_file(
     return downloaded_paths[0]
 
 
+from execution import run_execute_command
+from file_request import request_file, request_file_list, upload_result_file
+
+
 def run_worker_task(
     connection: socket.socket,
     master_ip_address: str,
@@ -96,7 +100,7 @@ def run_worker_task(
     execute_command_template: str,
     simulate_failure_after: float | None = None,
 ) -> None:
-    """Handle ready message, fetch allocated part file, run execute_command, and send finished signal."""
+    """Handle ready message, fetch allocated part file, run execute_command, send finished signal, and upload result."""
     ready_message = receive_ready_message(connection)
     file_transfer_port = ready_message["file_transfer_port"]
 
@@ -109,18 +113,29 @@ def run_worker_task(
 
     send_file_received_message(connection)
 
-    # Phase 3: Execute task on the downloaded part file.
-    # Note: Pressing 'k' during execution will raise KeyboardInterrupt to simulate node failure/kill.
+    # Phase 3 & 4: Execute task on the downloaded part file.
+    # Force-stops process if connection is lost or user presses 'k'.
     elapsed_time = run_execute_command(
         execute_command_template,
         input_file=downloaded_path,
         output_directory=WORKER_OUTPUT_DIRECTORY,
+        connection=connection,
         simulate_failure_after=simulate_failure_after,
     )
 
     part_filename = Path(downloaded_path).name
+    output_filepath = Path(WORKER_OUTPUT_DIRECTORY) / part_filename
+
+    # Send finished signal to Master over control port
     send_finished_message(connection, elapsed_time, part_filename)
+
+    # Phase 4 Task 4.1: Upload completed output file back to Master's per-node file-transfer daemon
+    if output_filepath.is_file():
+        upload_result_file(master_ip_address, file_transfer_port, str(output_filepath))
+        print(f"Uploaded result {part_filename} to master daemon on port {file_transfer_port}")
+
     print(f"{PROGRESS_FINISHED} for worker ({part_filename})")
+
 
 
 def run_worker() -> None:

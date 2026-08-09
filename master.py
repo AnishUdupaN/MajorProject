@@ -1,4 +1,4 @@
-"""Master node entry point: load config, validate node list, split video, distribute parts, and track Phase 3 execution."""
+"""Master node entry point: load config, validate node list, split video, distribute parts, track execution, collect results, and merge."""
 
 import argparse
 import select
@@ -15,6 +15,7 @@ from constants import (
     MASTER_OUTPUT_DIRECTORY,
     PROGRESS_EXECUTING,
     PROGRESS_FINISHED,
+    PROGRESS_RECEIVING_FILES,
     PROGRESS_SENDING_FILE,
 )
 from control_messages import (
@@ -24,6 +25,7 @@ from control_messages import (
 )
 from devices import swap_device_ip, write_devices_json
 from file_transfer_daemon import FileTransferDaemon, start_file_transfer_daemon
+from merge import run_merge_command
 from network import get_local_ip_for_peer
 from split import part_filename_for_node, run_split_command, verify_part_files
 
@@ -151,6 +153,7 @@ def distribute_part_file_to_single_node(
     daemon = start_file_transfer_daemon(
         allocated_filenames=[part_filename],
         serve_directory=parts_directory,
+        output_directory=MASTER_OUTPUT_DIRECTORY,
     )
     if daemon.port is None:
         raise RuntimeError("File-transfer daemon did not report a listening port")
@@ -178,6 +181,7 @@ def distribute_part_files_to_active_nodes(
         daemon = start_file_transfer_daemon(
             allocated_filenames=[part_filename],
             serve_directory=parts_directory,
+            output_directory=MASTER_OUTPUT_DIRECTORY,
         )
         daemons.append(daemon)
         if daemon.port is None:
@@ -251,7 +255,7 @@ def reassign_task_to_spare_node(
     return spare_ip, spare_connection, daemon
 
 
-def monitor_worker_executions_and_handle_failover(
+def monitor_worker_executions_and_collect_results(
     active_nodes: list[str],
     worker_connections: dict[str, socket.socket],
     spare_nodes: list[str],
@@ -259,7 +263,7 @@ def monitor_worker_executions_and_handle_failover(
     parts_directory: str,
     master_ip_address: str | None = None,
 ) -> list[FileTransferDaemon]:
-    """Track Phase 3 execution state, print live timer, and reassign tasks on node drop/failure."""
+    """Track Phase 3 execution and Phase 4 result collection (receiving files -> finished), with failover."""
     active_tasks: dict[str, dict] = {}
     for node_index, worker_ip in enumerate(active_nodes, start=1):
         active_tasks[worker_ip] = {
@@ -267,30 +271,38 @@ def monitor_worker_executions_and_handle_failover(
             "part_filename": part_filename_for_node(node_index),
             "connection": worker_connections[worker_ip],
             "start_time": time.time(),
-            "finished": False,
+            "exec_finished": False,
+            "file_received": False,
         }
 
     active_daemons: list[FileTransferDaemon] = []
 
-    print("\n--- Starting Phase 3 Execution Monitoring ---")
+    print("\n--- Starting Phase 3 Execution & Phase 4 Result Collection ---")
 
     while True:
-        unfinished_ips = [ip for ip, task in active_tasks.items() if not task["finished"]]
+        unfinished_ips = [ip for ip, task in active_tasks.items() if not task["file_received"]]
         if not unfinished_ips:
-            print("\nAll active workers have successfully completed execution!")
+            print("\nAll active worker outputs have been collected!")
             break
 
         for ip in unfinished_ips:
             task = active_tasks[ip]
-            elapsed = int(time.time() - task["start_time"])
-            minutes, secs = elapsed // 60, elapsed % 60
-            print(
-                f"{PROGRESS_EXECUTING} ({ip}, {task['part_filename']}) - live running time: {minutes:02d}:{secs:02d}"
-            )
+            if not task["exec_finished"]:
+                elapsed = int(time.time() - task["start_time"])
+                minutes, secs = elapsed // 60, elapsed % 60
+                print(
+                    f"{PROGRESS_EXECUTING} ({ip}, {task['part_filename']}) - live running time: {minutes:02d}:{secs:02d}"
+                )
+            else:
+                print(f"{PROGRESS_RECEIVING_FILES} ({ip}, {task['part_filename']})")
 
         # Check sockets for incoming finished/failed messages or disconnections
-        socket_map = {task["connection"]: ip for ip, task in active_tasks.items() if not task["finished"]}
-        readable, _, _ = select.select(list(socket_map.keys()), [], [], 1.5)
+        socket_map = {
+            task["connection"]: ip
+            for ip, task in active_tasks.items()
+            if not task["file_received"]
+        }
+        readable, _, _ = select.select(list(socket_map.keys()), [], [], 1.0)
 
         for sock in readable:
             ip = socket_map[sock]
@@ -299,42 +311,59 @@ def monitor_worker_executions_and_handle_failover(
             try:
                 msg = receive_json_message(sock)
                 if msg.get("type") == "finished":
-                    task["finished"] = True
+                    task["exec_finished"] = True
                     exec_time = msg.get("execution_time", 0.0)
                     print(
-                        f"\n[FINISHED] Node {ip} finished processing {task['part_filename']} in {exec_time:.2f}s"
+                        f"\n[EXECUTION COMPLETE] Node {ip} finished {task['part_filename']} in {exec_time:.2f}s"
                     )
+                    print(f"{PROGRESS_RECEIVING_FILES} ({ip}, {task['part_filename']})")
                 elif msg.get("type") == "failed":
                     raise ConnectionError(f"Node reported failure: {msg.get('reason')}")
             except (ConnectionError, OSError, ValueError, KeyError) as exc:
-                print(f"\n[FAILURE DETECTED] Node {ip} socket error/disconnect: {exc}")
-                sock.close()
-                node_index = task["node_index"]
-                del active_tasks[ip]
+                if not task["exec_finished"]:
+                    print(f"\n[FAILURE DETECTED] Node {ip} socket error/disconnect: {exc}")
+                    sock.close()
+                    node_index = task["node_index"]
+                    del active_tasks[ip]
 
-                spare_ip, spare_conn, daemon = reassign_task_to_spare_node(
-                    ip,
-                    node_index,
-                    spare_nodes,
-                    listening_socket,
-                    parts_directory,
-                    master_ip_address,
-                )
-                active_daemons.append(daemon)
-                active_tasks[spare_ip] = {
-                    "node_index": node_index,
-                    "part_filename": part_filename_for_node(node_index),
-                    "connection": spare_conn,
-                    "start_time": time.time(),
-                    "finished": False,
-                }
-                print(f"{PROGRESS_EXECUTING} resumed for spare worker {spare_ip} ({part_filename_for_node(node_index)})")
+                    spare_ip, spare_conn, daemon = reassign_task_to_spare_node(
+                        ip,
+                        node_index,
+                        spare_nodes,
+                        listening_socket,
+                        parts_directory,
+                        master_ip_address,
+                    )
+                    active_daemons.append(daemon)
+                    active_tasks[spare_ip] = {
+                        "node_index": node_index,
+                        "part_filename": part_filename_for_node(node_index),
+                        "connection": spare_conn,
+                        "start_time": time.time(),
+                        "exec_finished": False,
+                        "file_received": False,
+                    }
+                    print(
+                        f"{PROGRESS_EXECUTING} resumed for spare worker {spare_ip} ({part_filename_for_node(node_index)})"
+                    )
+
+        # Check if received output files have arrived in master/output/
+        for ip, task in list(active_tasks.items()):
+            if task["exec_finished"] and not task["file_received"]:
+                expected_output_file = Path(MASTER_OUTPUT_DIRECTORY) / task["part_filename"]
+                if expected_output_file.is_file():
+                    task["file_received"] = True
+                    print(
+                        f"{PROGRESS_FINISHED} ({ip}, {task['part_filename']}) - result saved to {expected_output_file}"
+                    )
+
+        time.sleep(0.5)
 
     return active_daemons
 
 
 def run_master() -> None:
-    """Load config, validate addresses, split video, distribute parts, and run execution monitoring."""
+    """Load config, validate addresses, split video, distribute parts, track execution, collect results, and merge."""
     arguments = parse_master_arguments()
 
     try:
@@ -392,8 +421,8 @@ def run_master() -> None:
 
         print("\nPhase 2 complete: split files distributed to all active workers.")
 
-        # Phase 3: Monitor execution, display live running time, and handle failover reassignment.
-        failover_daemons = monitor_worker_executions_and_handle_failover(
+        # Phase 3 & Phase 4 (Task 4.1): Monitor execution, handle failover, and collect result files
+        failover_daemons = monitor_worker_executions_and_collect_results(
             active_nodes,
             worker_connections,
             spare_nodes,
@@ -403,7 +432,15 @@ def run_master() -> None:
         )
         daemons.extend(failover_daemons)
 
-        print("\nPhase 3 complete: all tasks executed successfully.")
+        print("\nPhase 4 Result Collection complete: all part files received.")
+
+        # Phase 4 (Task 4.2): Merge output part files into single final video
+        run_merge_command(
+            config.merge_command,
+            len(active_nodes),
+            output_directory=MASTER_OUTPUT_DIRECTORY,
+        )
+
     except KeyboardInterrupt:
         print("\nMaster shutting down.")
     except (OSError, RuntimeError, ValueError, FileNotFoundError) as exc:
