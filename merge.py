@@ -64,12 +64,20 @@ def run_merge_command(
     resolved_command = build_merge_command(merge_command_template, output_directory)
     command_parts = shlex.split(resolved_command)
 
-    result = subprocess.run(command_parts, check=False)
+    result = subprocess.run(
+        command_parts,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"merge_command failed with exit code {result.returncode}: {resolved_command}"
+            f"merge_command failed with exit code {result.returncode}:\n{result.stderr.strip()}"
         )
+
 
     final_output_path = Path(output_directory) / "output.mkv"
     if not final_output_path.is_file():
