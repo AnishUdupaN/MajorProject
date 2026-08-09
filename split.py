@@ -99,11 +99,20 @@ def run_split_command(
         split_command, active_node_count, input_video, parts_directory
     )
     command_parts = shlex.split(resolved_command)
-    result = subprocess.run(command_parts, check=False)
+    result = subprocess.run(
+        command_parts,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
     if result.returncode != 0:
         raise RuntimeError(
-            f"split_command failed with exit code {result.returncode}: {resolved_command}"
+            f"split_command failed with exit code {result.returncode}:\n{result.stderr.strip()}"
         )
+
+
 
 
 def verify_part_files(
