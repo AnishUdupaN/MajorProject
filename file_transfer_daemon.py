@@ -23,11 +23,14 @@ class FileTransferDaemon:
         self,
         allocated_filenames: list[str],
         serve_directory: str,
+        output_directory: str | None = None,
     ) -> None:
         self.allocated_filenames = allocated_filenames
         self.serve_directory = serve_directory
+        self.output_directory = output_directory
         self.port: int | None = None
         self._process: subprocess.Popen[str] | None = None
+
 
     def start(self) -> None:
         """Start this node's file-transfer daemon in a separate process."""
@@ -36,14 +39,17 @@ class FileTransferDaemon:
             str(Path(__file__).resolve()),
             "--serve-directory",
             self.serve_directory,
-            "--files",
-            *self.allocated_filenames,
         ]
+        if self.output_directory:
+            command.extend(["--output-directory", self.output_directory])
+        command.extend(["--files", *self.allocated_filenames])
+
         self._process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             text=True,
         )
+
         self.port = read_daemon_port(self._process)
         wait_for_daemon_port(self._process, self.port)
 
@@ -55,17 +61,21 @@ class FileTransferDaemon:
 
 
 def _make_handler_class(
-    allocated_filenames: list[str], serve_directory: Path
+    allocated_filenames: list[str],
+    serve_directory: Path,
+    output_directory: Path | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Build a request handler bound to one node's allocated files."""
     files_for_node = allocated_filenames
     directory_for_node = serve_directory
+    output_dir_for_node = output_directory or serve_directory
 
     class FileTransferRequestHandler(BaseHTTPRequestHandler):
-        """Handle GET /listfiles and GET /file/<filename> for one node."""
+        """Handle GET /listfiles, GET /file/<filename>, and POST /file/<filename> for one node."""
 
         allocated_filenames = files_for_node
         serve_directory = directory_for_node
+        output_directory = output_dir_for_node
 
         def log_message(self, format: str, *args) -> None:
             return
@@ -76,6 +86,12 @@ def _make_handler_class(
                 return
             if self.path.startswith("/file/"):
                 self._send_file()
+                return
+            self.send_error(404, "Not Found")
+
+        def do_POST(self) -> None:
+            if self.path.startswith("/file/") or self.path.startswith("/upload/"):
+                self._receive_file()
                 return
             self.send_error(404, "Not Found")
 
@@ -107,7 +123,32 @@ def _make_handler_class(
             self.end_headers()
             self.wfile.write(file_bytes)
 
+        def _receive_file(self) -> None:
+            """POST /file/<filename> receives uploaded result file bytes from worker."""
+            filename = unquote(
+                self.path.removeprefix("/file/")
+                .removeprefix("/upload/")
+                .lstrip("/")
+            )
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length <= 0:
+                self.send_error(400, "Bad Request - missing Content-Length")
+                return
+
+            file_bytes = self.rfile.read(content_length)
+            self.output_directory.mkdir(parents=True, exist_ok=True)
+            output_file_path = self.output_directory / filename
+            output_file_path.write_bytes(file_bytes)
+
+            payload = json.dumps({"status": "received", "filename": filename}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
     return FileTransferRequestHandler
+
 
 
 def read_daemon_port(
@@ -165,10 +206,12 @@ def wait_for_daemon_port(
 def run_file_transfer_daemon(
     allocated_filenames: list[str],
     serve_directory: str,
+    output_directory: str | None = None,
 ) -> None:
     """Run one file-transfer daemon process for a single active node."""
+    output_path = Path(output_directory).resolve() if output_directory else None
     handler_class = _make_handler_class(
-        allocated_filenames, Path(serve_directory).resolve()
+        allocated_filenames, Path(serve_directory).resolve(), output_path
     )
     server = HTTPServer(("0.0.0.0", 0), handler_class)
     port = server.server_address[1]
@@ -180,9 +223,10 @@ def run_file_transfer_daemon(
 def start_file_transfer_daemon(
     allocated_filenames: list[str],
     serve_directory: str,
+    output_directory: str | None = None,
 ) -> FileTransferDaemon:
     """Start a separate file-transfer daemon instance for one active node."""
-    daemon = FileTransferDaemon(allocated_filenames, serve_directory)
+    daemon = FileTransferDaemon(allocated_filenames, serve_directory, output_directory)
     daemon.start()
     return daemon
 
@@ -193,6 +237,7 @@ def parse_daemon_arguments() -> argparse.Namespace:
         description="Run one per-node HTTP file-transfer daemon instance."
     )
     parser.add_argument("--serve-directory", required=True)
+    parser.add_argument("--output-directory", default=None)
     parser.add_argument("--files", nargs="+", required=True)
     return parser.parse_args()
 
@@ -202,4 +247,5 @@ if __name__ == "__main__":
     run_file_transfer_daemon(
         arguments.files,
         arguments.serve_directory,
+        arguments.output_directory,
     )

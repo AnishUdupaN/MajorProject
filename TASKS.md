@@ -123,16 +123,17 @@ conversion** wherever possible:
 ## Phase 4 — Collecting Results & Merge
 
 ### Task 4.1: Result collection
-- [ ] After a worker's "finished" message, master starts a **receive-side listener on that same node's dedicated file-transfer daemon** (the per-node daemon/port from Task 2.2 — reused here, not a new shared endpoint), so the worker sends its output file back on the port it already knows.
-- [ ] Progress state `receiving files` shown per worker while its result is incoming.
-- [ ] Once a worker's file is fully received, progress state for that worker becomes `finished`.
+- [x] After a worker's "finished" message, master starts a **receive-side listener on that same node's dedicated file-transfer daemon** (the per-node daemon/port from Task 2.2 — reused here, not a new shared endpoint), so the worker sends its output file back on the port it already knows.
+- [x] Progress state `receiving files` shown per worker while its result is incoming.
+- [x] Once a worker's file is fully received, progress state for that worker becomes `finished`.
 - **Deliverable:** receive-side addition to the per-node file-transfer daemon + per-node status tracking.
 
 ### Task 4.2: Merge
-- [ ] Once **all** worker nodes show `finished`, master runs `merge_command` from config to combine all output parts into one final file.
-- [ ] Progress state `merging files` shown during this step.
-- [ ] After merge completes, overall progress state becomes `finished`.
+- [x] Once **all** worker nodes show `finished`, master runs `merge_command` from config to combine all output parts into one final file.
+- [x] Progress state `merging files` shown during this step.
+- [x] After merge completes, overall progress state becomes `finished`.
 - **Deliverable:** merge step wired into master's main flow; end-of-run signal.
+
 
 ---
 
