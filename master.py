@@ -28,6 +28,8 @@ from file_transfer_daemon import FileTransferDaemon, start_file_transfer_daemon
 from merge import run_merge_command
 from network import get_local_ip_for_peer
 from split import part_filename_for_node, run_split_command, verify_part_files
+from ui import StatusDashboard
+
 
 
 def parse_master_arguments() -> argparse.Namespace:
@@ -262,6 +264,7 @@ def monitor_worker_executions_and_collect_results(
     listening_socket: socket.socket,
     parts_directory: str,
     master_ip_address: str | None = None,
+    dashboard: StatusDashboard | None = None,
 ) -> list[FileTransferDaemon]:
     """Track Phase 3 execution and Phase 4 result collection (receiving files -> finished), with failover."""
     active_tasks: dict[str, dict] = {}
@@ -287,14 +290,23 @@ def monitor_worker_executions_and_collect_results(
 
         for ip in unfinished_ips:
             task = active_tasks[ip]
+            elapsed = time.time() - task["start_time"]
+            node_id = f"node{task['node_index']}"
             if not task["exec_finished"]:
-                elapsed = int(time.time() - task["start_time"])
-                minutes, secs = elapsed // 60, elapsed % 60
+                minutes, secs = int(elapsed) // 60, int(elapsed) % 60
                 print(
                     f"{PROGRESS_EXECUTING} ({ip}, {task['part_filename']}) - live running time: {minutes:02d}:{secs:02d}"
                 )
+                if dashboard:
+                    dashboard.update_node(
+                        ip, node_id, task["part_filename"], PROGRESS_EXECUTING, elapsed
+                    )
             else:
                 print(f"{PROGRESS_RECEIVING_FILES} ({ip}, {task['part_filename']})")
+                if dashboard:
+                    dashboard.update_node(
+                        ip, node_id, task["part_filename"], PROGRESS_RECEIVING_FILES
+                    )
 
         # Check sockets for incoming finished/failed messages or disconnections
         socket_map = {
@@ -317,6 +329,10 @@ def monitor_worker_executions_and_collect_results(
                         f"\n[EXECUTION COMPLETE] Node {ip} finished {task['part_filename']} in {exec_time:.2f}s"
                     )
                     print(f"{PROGRESS_RECEIVING_FILES} ({ip}, {task['part_filename']})")
+                    if dashboard:
+                        dashboard.update_node(
+                            ip, f"node{task['node_index']}", task["part_filename"], PROGRESS_RECEIVING_FILES
+                        )
                 elif msg.get("type") == "failed":
                     raise ConnectionError(f"Node reported failure: {msg.get('reason')}")
             except (ConnectionError, OSError, ValueError, KeyError) as exc:
@@ -356,6 +372,10 @@ def monitor_worker_executions_and_collect_results(
                     print(
                         f"{PROGRESS_FINISHED} ({ip}, {task['part_filename']}) - result saved to {expected_output_file}"
                     )
+                    if dashboard:
+                        dashboard.update_node(
+                            ip, f"node{task['node_index']}", task["part_filename"], PROGRESS_FINISHED
+                        )
 
         time.sleep(0.5)
 
@@ -390,6 +410,8 @@ def run_master() -> None:
     Path(arguments.parts_directory).mkdir(parents=True, exist_ok=True)
     Path(MASTER_OUTPUT_DIRECTORY).mkdir(parents=True, exist_ok=True)
 
+    dashboard = StatusDashboard(master_state="initializing")
+
     print(f"Loaded config from {arguments.config}")
     print(f"Active nodes ({len(active_nodes)}): {', '.join(active_nodes)}")
     print(f"Spare nodes ({len(spare_nodes)}): {', '.join(spare_nodes)}")
@@ -404,12 +426,16 @@ def run_master() -> None:
             listening_socket, active_nodes
         )
 
+        dashboard.set_master_state("splitting file")
         run_split_command(
             config.split_command,
             len(active_nodes),
             parts_directory=arguments.parts_directory,
         )
         verify_part_files(len(active_nodes), arguments.parts_directory)
+
+        for idx, ip in enumerate(active_nodes, start=1):
+            dashboard.update_node(ip, f"node{idx}", part_filename_for_node(idx), "sending file")
 
         initial_daemons = distribute_part_files_to_active_nodes(
             active_nodes,
@@ -429,17 +455,20 @@ def run_master() -> None:
             listening_socket,
             arguments.parts_directory,
             master_ip_address=arguments.master_ip,
+            dashboard=dashboard,
         )
         daemons.extend(failover_daemons)
 
         print("\nPhase 4 Result Collection complete: all part files received.")
 
         # Phase 4 (Task 4.2): Merge output part files into single final video
+        dashboard.set_master_state("merging files")
         run_merge_command(
             config.merge_command,
             len(active_nodes),
             output_directory=MASTER_OUTPUT_DIRECTORY,
         )
+        dashboard.set_master_state("finished")
 
     except KeyboardInterrupt:
         print("\nMaster shutting down.")
@@ -450,6 +479,7 @@ def run_master() -> None:
         for daemon in daemons:
             daemon.stop()
         listening_socket.close()
+
 
 
 if __name__ == "__main__":

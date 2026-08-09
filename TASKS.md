@@ -140,8 +140,8 @@ conversion** wherever possible:
 ## Phase 5 — Progress Display / UI
 
 ### Task 5.1: Progress reporting surface
-- [ ] Design a simple live status view (CLI table, log lines, or minimal web/dashboard — pick one) showing, per node: current state (`sending file` / `executing` / `receiving files` / `finished`) and running time where applicable.
-- [ ] Show master-level states (`splitting file`, `merging files`, `finished`) separately from per-node rows.
+- [x] Design a simple live status view (CLI table, log lines, or minimal web/dashboard — pick one) showing, per node: current state (`sending file` / `executing` / `receiving files` / `finished`) and running time where applicable.
+- [x] Show master-level states (`splitting file`, `merging files`, `finished`) separately from per-node rows.
 - **Deliverable:** status display module consuming events from master.
 
 ---
@@ -149,19 +149,20 @@ conversion** wherever possible:
 ## Phase 6 — Integration & Demo Run
 
 ### Task 6.1: End-to-end wiring
-- [ ] Connect all phases into one runnable flow: config load → split → distribute → execute → collect → merge → done.
-- [ ] Confirm task allocation strictly follows IP-address entry order, and confirm startup rejects address lists shorter than `max_nodes + 1`.
+- [x] Connect all phases into one runnable flow: config load → split → distribute → execute → collect → merge → done.
+- [x] Confirm task allocation strictly follows IP-address entry order, and confirm startup rejects address lists shorter than `max_nodes + 1`.
 - **Deliverable:** working end-to-end script/entry point.
 
 ### Task 6.2: Failover demo script
-- [ ] Prepare a repeatable demo: start master + at least `max_nodes + 1` workers (all listening on port `5000`), kick off a run, and mid-execution trigger either a CPU-throttle or disconnect on one active node.
-- [ ] Confirm the next available spare node picks up that task and the run still reaches overall `finished`.
+- [x] Prepare a repeatable demo: start master + at least `max_nodes + 1` workers (all listening on port `5000`), kick off a run, and mid-execution trigger either a CPU-throttle or disconnect on one active node.
+- [x] Confirm the next available spare node picks up that task and the run still reaches overall `finished`.
 - **Deliverable:** demo runbook/script for the live prototype walkthrough.
 
 ### Task 6.3: Dry-run / test pass
-- [ ] Run full pipeline on a sample video with `max_nodes = 2` and 4 total addresses given (2 active + 2 spares, to confirm "at least" is honored, not just "exactly") with no failure — confirm every progress state appears in the correct order.
-- [ ] Run again forcing a failure on one node — confirm failover to the next spare + correct final merged output.
+- [x] Run full pipeline on a sample video with `max_nodes = 2` and 4 total addresses given (2 active + 2 spares, to confirm "at least" is honored, not just "exactly") with no failure — confirm every progress state appears in the correct order.
+- [x] Run again forcing a failure on one node — confirm failover to the next spare + correct final merged output.
 - **Deliverable:** test notes / checklist confirming both scenarios pass.
+
 
 ---
 
