@@ -3,7 +3,12 @@
 import json
 import socket
 
-from constants import MESSAGE_TYPE_FILE_RECEIVED, MESSAGE_TYPE_READY
+from constants import (
+    MESSAGE_TYPE_FAILED,
+    MESSAGE_TYPE_FILE_RECEIVED,
+    MESSAGE_TYPE_FINISHED,
+    MESSAGE_TYPE_READY,
+)
 
 
 def send_json_message(connection: socket.socket, message: dict) -> None:
@@ -56,3 +61,44 @@ def receive_file_received_message(connection: socket.socket) -> None:
     message = receive_json_message(connection)
     if message.get("type") != MESSAGE_TYPE_FILE_RECEIVED:
         raise ValueError(f"Expected file_received message, got: {message!r}")
+
+
+def send_finished_message(
+    connection: socket.socket, execution_time_seconds: float, part_filename: str
+) -> None:
+    """Worker sends finished message to master on completing execution."""
+    send_json_message(
+        connection,
+        {
+            "type": MESSAGE_TYPE_FINISHED,
+            "execution_time": execution_time_seconds,
+            "part_filename": part_filename,
+        },
+    )
+
+
+def receive_finished_message(connection: socket.socket) -> dict:
+    """Master receives finished message from worker."""
+    message = receive_json_message(connection)
+    if message.get("type") != MESSAGE_TYPE_FINISHED:
+        raise ValueError(f"Expected finished message, got: {message!r}")
+    return message
+
+
+def send_failed_message(connection: socket.socket, reason: str) -> None:
+    """Worker sends failed message to master when task fails or is killed."""
+    send_json_message(
+        connection,
+        {
+            "type": MESSAGE_TYPE_FAILED,
+            "reason": reason,
+        },
+    )
+
+
+def receive_failed_message(connection: socket.socket) -> dict:
+    """Master receives failed message from worker."""
+    message = receive_json_message(connection)
+    if message.get("type") != MESSAGE_TYPE_FAILED:
+        raise ValueError(f"Expected failed message, got: {message!r}")
+    return message
