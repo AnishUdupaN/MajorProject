@@ -1,6 +1,10 @@
 """Shared constants for the distributed video processing prototype."""
 
-FIXED_PORT = 5000
+CONTROL_PORT = 5000
+FIXED_PORT = CONTROL_PORT
+
+DEVICES_JSON_FILE = "devices.json"
+DEVICE_ID_PREFIX = "node"
 
 CONFIG_KEY_SPLIT_COMMAND = "split_command"
 CONFIG_KEY_EXECUTE_COMMAND = "execute_command"
@@ -20,3 +24,18 @@ PROGRESS_EXECUTING = "executing"
 PROGRESS_RECEIVING_FILES = "receiving files"
 PROGRESS_FINISHED = "finished"
 PROGRESS_MERGING_FILES = "merging files"
+
+MESSAGE_TYPE_READY = "ready"
+MESSAGE_TYPE_FILE_RECEIVED = "file_received"
+
+PART_FILENAME_PREFIX = "part"
+PART_FILENAME_SUFFIX = ".mkv"
+
+# Role-specific working directories under the project root.
+MASTER_DIRECTORY = "master"
+WORKER_DIRECTORY = "worker"
+
+MASTER_INPUT_DIRECTORY = f"{MASTER_DIRECTORY}/input"
+MASTER_OUTPUT_DIRECTORY = f"{MASTER_DIRECTORY}/output"
+WORKER_INPUT_DIRECTORY = f"{WORKER_DIRECTORY}/input"
+WORKER_OUTPUT_DIRECTORY = f"{WORKER_DIRECTORY}/output"

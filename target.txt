@@ -1,0 +1,24 @@
+we start the master node by mentioning the ip address of individual nodes
+for worker nodes, we start it by mentioning the address of the master node
+file transfer with fixed port number.
+master node splits the video file into part1.mkv, part2.mkv,etc. the progress will be displayed as "splitting file".
+master sends ready message to all the selected nodes.
+the nodes request for the file and the master node sends it. the progress will be displayed as "sending file".
+then the worker node executes the program. the progress will be displayed as "executing" for corresponding nodes, along with the running time for execution of each node.
+then the worker nodes send finished message to the master and master starts an file transfer program, to which the worker nodes send the files. the progress will be displayed as "receiving files" for each appropriate worker node.
+after the file has been received, the progress of that node will be shown as "finished".
+when all the worker nodes have finished running, the master node combines all the outputs into one file. the progress will be displayed as "merging files".
+after completion, the progress will be displayed as "finished".
+
+
+in this prototype, we have only 4 parameters in the config file.
+
+split_command
+execute_command
+merge_command
+max_nodes
+
+to show how the task works, we intentionally add another extra node so that when one task throttles, the task will be transferred to the extra node.
+we do not include any sorting benchmarking as of now. the task will be allocated in the order of the entered IP addresses.
+
+to show throttling or disconnection, we either track the cpu usage of the system (not the app) in linux or just disconnecting the node from the network. theoretically, when disconnection happens, the task will be allocated to the extra node. no continuation of task and reconnection as of now.
