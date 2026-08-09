@@ -22,3 +22,5 @@ to show how the task works, we intentionally add another extra node so that when
 we do not include any sorting benchmarking as of now. the task will be allocated in the order of the entered IP addresses.
 
 to show throttling or disconnection, we either track the cpu usage of the system (not the app) in linux or just disconnecting the node from the network. theoretically, when disconnection happens, the task will be allocated to the extra node. no continuation of task and reconnection as of now.
+
+it would be great if all the worker nodes pipe every terminal output to the master node and master node then stores them on logs folder inside which it has master,node1,node2, and so on and also displays them on the terminal.
