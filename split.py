@@ -60,15 +60,20 @@ def build_split_command(
     explicit, fixed list of N-1 cut points, which always yields exactly N
     output files, regardless of keyframe layout.
     """
-    duration_seconds = get_video_duration_seconds(input_video)
-    split_points = [
-        duration_seconds * node_index / active_node_count
-        for node_index in range(1, active_node_count)
-    ]
-    segment_times = ",".join(f"{split_point:.3f}" for split_point in split_points)
-    resolved_command = split_command.replace("{segment_times}", segment_times)
+    if "{segment_times}" in split_command:
+        duration_seconds = get_video_duration_seconds(input_video)
+        split_points = [
+            duration_seconds * node_index / active_node_count
+            for node_index in range(1, active_node_count)
+        ]
+        segment_times = ",".join(f"{split_point:.3f}" for split_point in split_points)
+        resolved_command = split_command.replace("{segment_times}", segment_times)
+    else:
+        resolved_command = split_command
+
     resolved_command = resolved_command.replace("{input_directory}", parts_directory)
     return resolved_command
+
 
 
 def run_split_command(

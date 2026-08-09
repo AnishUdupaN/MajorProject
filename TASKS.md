@@ -103,19 +103,20 @@ conversion** wherever possible:
 ## Phase 3 — Execution
 
 ### Task 3.1: Worker execution
-- [ ] On receiving its part file, worker runs `execute_command` (from config) against it.
-- [ ] Progress state `executing` shown for that worker, along with **live/running elapsed time** for that node's execution.
-- [ ] On completion, worker sends a "finished" message to master.
+- [x] On receiving its part file, worker runs `execute_command` (from config) against it.
+- [x] Progress state `executing` shown for that worker, along with **live/running elapsed time** for that node's execution.
+- [x] On completion, worker sends a "finished" message to master.
 - **Deliverable:** execution runner + timer + finished-signal.
 
 ### Task 3.2: Failure / throttle detection (demo mechanism)
-- [ ] Implement Linux system-level (not per-app) CPU usage monitor on worker or master-side polling.
-- [ ] Implement manual "disconnect node from network" demo path (e.g., a script/toggle to simulate a node drop).
-- [ ] On detecting throttle/disconnect for a task-node: mark that node's task as failed, and reassign the task to the **next unused spare address** in the list (in order) using the same ready→request→send→execute flow (Tasks 2.2, 3.1). No resume/reconnect logic needed — spare starts the task from scratch.
-- [ ] **`devices.json` swap on reassignment:** when a worker process is killed/disconnected and its task is reassigned to a spare, find that killed node's entry in `devices.json` (by its old IP, mapped to its device ID e.g. `node2`) and **replace the IP address on that entry with the new spare node's IP**, keeping the same device ID. Do not create a new device ID for the spare — it takes over the killed node's identity in `devices.json`.
-- [ ] Because the device ID (and therefore its already-split `partN.mkv` file) stays associated with the same entry, just with a swapped IP, the master can **reuse the already-created split file** for that part and send it straight to the new node via that node's file-transfer daemon (Task 2.2) — **no re-running of `split_command`** for that part.
-- [ ] If more failures occur than there are remaining spares, this is out of scope for the prototype — just log/fail clearly, no further handling needed.
+- [x] Implement Linux system-level (not per-app) CPU usage monitor on worker or master-side polling.
+- [x] Implement manual "disconnect node from network" demo path (e.g., a script/toggle or interactive 'k' key press to simulate a node drop/kill).
+- [x] On detecting throttle/disconnect for a task-node: mark that node's task as failed, and reassign the task to the **next unused spare address** in the list (in order) using the same ready→request→send→execute flow (Tasks 2.2, 3.1). No resume/reconnect logic needed — spare starts the task from scratch.
+- [x] **`devices.json` swap on reassignment:** when a worker process is killed/disconnected and its task is reassigned to a spare, find that killed node's entry in `devices.json` (by its old IP, mapped to its device ID e.g. `node2`) and **replace the IP address on that entry with the new spare node's IP**, keeping the same device ID. Do not create a new device ID for the spare — it takes over the killed node's identity in `devices.json`.
+- [x] Because the device ID (and therefore its already-split `partN.mkv` file) stays associated with the same entry, just with a swapped IP, the master can **reuse the already-created split file** for that part and send it straight to the new node via that node's file-transfer daemon (Task 2.2) — **no re-running of `split_command`** for that part.
+- [x] If more failures occur than there are remaining spares, this is out of scope for the prototype — just log/fail clearly, no further handling needed.
 - **Deliverable:** monitor module + failover trigger + reassignment logic.
+
 
 ---
 
