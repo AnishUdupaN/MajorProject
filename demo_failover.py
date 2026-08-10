@@ -11,7 +11,7 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_DIR))
 
-from devices import DEVICES_JSON_FILE
+from core import DEVICES_JSON_FILE
 
 
 def run_failover_demo() -> None:

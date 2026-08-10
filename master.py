@@ -8,8 +8,7 @@ import threading
 import time
 from pathlib import Path
 
-from config import load_config
-from constants import (
+from core import (
     CONTROL_PORT,
     FIXED_PORT,
     MASTER_INPUT_DIRECTORY,
@@ -18,22 +17,32 @@ from constants import (
     PROGRESS_FINISHED,
     PROGRESS_RECEIVING_FILES,
     PROGRESS_SENDING_FILE,
-)
-from control_messages import (
+    FileTransferDaemon,
+    StatusDashboard,
+    get_local_ip_for_peer,
     has_buffered_message,
+    load_config,
+    part_filename_for_node,
     receive_file_received_message,
     receive_json_message,
+    run_merge_command,
+    run_split_command,
     send_ready_message,
     send_shutdown_message,
+    start_file_transfer_daemon,
+    swap_device_ip,
+    verify_part_files,
+    write_devices_json,
 )
 
-from devices import swap_device_ip, write_devices_json
-from file_transfer_daemon import FileTransferDaemon, start_file_transfer_daemon
-from merge import run_merge_command
-from network import get_local_ip_for_peer
-from split import part_filename_for_node, run_split_command, verify_part_files
-from ui import StatusDashboard
+f=open("logs.txt","w")
+f.write("")
+f.close()
 
+def printlog(st):
+    f=open("logs.txt","a+")
+    f.write(st+"\n")
+    f.close()
 
 class WorkerConnectionPool:
     """Thread-safe pool accepting worker connections dynamically at any time."""
@@ -76,7 +85,7 @@ class WorkerConnectionPool:
                         except Exception:
                             pass
                     self.connections[ip] = conn
-                    print(f"\n[POOL] Worker {ip}:{addr[1]} connected and kept in IDLE pool.")
+                    printlog(f"\nWorker {ip}:{addr[1]} connected, kept IDLE.")
                     if self.dashboard:
                         existing = self.dashboard.node_states.get(ip)
                         if not existing or existing.get("node_id") == "worker":
@@ -197,10 +206,9 @@ def distribute_part_file_to_single_node(
         raise RuntimeError("File-transfer daemon did not report a listening port")
 
     reachable_master_ip = master_ip_address or get_local_ip_for_peer(worker_ip_address)
-    print(f"{PROGRESS_SENDING_FILE} ({worker_ip_address}, {part_filename})")
+    printlog(f"{PROGRESS_SENDING_FILE} ({worker_ip_address}, {part_filename})")
     send_ready_message(connection, reachable_master_ip, daemon.port)
     receive_file_received_message(connection)
-    print(f"Received {part_filename} confirmation from {worker_ip_address}")
     return daemon
 
 
@@ -246,13 +254,12 @@ def distribute_part_files_to_active_nodes(
         reachable_master_ip,
         file_transfer_port,
     ) in pending_transfers:
-        print(f"{PROGRESS_SENDING_FILE} ({worker_ip_address}, {part_filename})")
+        printlog(f"{PROGRESS_SENDING_FILE} ({worker_ip_address}, {part_filename})")
         send_ready_message(connection, reachable_master_ip, file_transfer_port)
 
     for worker_ip_address, part_filename, connection, _, _ in pending_transfers:
         receive_file_received_message(connection)
-        print(f"Received {part_filename} confirmation from {worker_ip_address}")
-
+        
     return daemons
 
 
@@ -271,17 +278,15 @@ def reassign_task_to_spare_node(
         )
 
     spare_ip = spare_nodes.pop(0)
-    print(
-        f"\n[FAILOVER] Node {failed_ip} failed 2 times. Reassigning task for node{node_index} to spare node {spare_ip}..."
-    )
+    printlog(f"\n Node {failed_ip} failed 2 times. Reassigning task to node{node_index}, {spare_ip}")
 
     updated_mapping = swap_device_ip(failed_ip, spare_ip)
-    print(f"[FAILOVER] Updated devices.json: {updated_mapping}")
+    printlog(f"[FAILOVER] Updated devices.json: {updated_mapping}")
 
     spare_connection = worker_pool.get_connection(spare_ip)
     part_filename = part_filename_for_node(node_index)
 
-    print(f"[FAILOVER] Reusing existing split file {part_filename} for spare node {spare_ip}")
+    printlog(f"[FAILOVER] Reusing existing split file {part_filename} for spare node {spare_ip}")
     daemon = distribute_part_file_to_single_node(
         spare_ip,
         part_filename,
@@ -316,12 +321,12 @@ def monitor_worker_executions_and_collect_results(
 
     active_daemons: list[FileTransferDaemon] = []
 
-    print("\n--- Starting Phase 3 Execution & Phase 4 Result Collection ---")
+    printlog("\n--- Starting Phase 3 Execution & Phase 4 Result Collection ---")
 
     while True:
         unfinished_ips = [ip for ip, task in active_tasks.items() if not task["file_received"]]
         if not unfinished_ips:
-            print("\nAll active worker outputs have been collected!")
+            printlog("\nAll active worker outputs have been collected!")
             break
 
         for ip in unfinished_ips:
@@ -330,15 +335,13 @@ def monitor_worker_executions_and_collect_results(
             node_id = f"node{task['node_index']}"
             if not task["exec_finished"]:
                 minutes, secs = int(elapsed) // 60, int(elapsed) % 60
-                print(
-                    f"{PROGRESS_EXECUTING} ({ip}, {task['part_filename']}) - live running time: {minutes:02d}:{secs:02d}"
-                )
+                printlog(f"{PROGRESS_EXECUTING} ({ip}, {task['part_filename']}) - live running time: {minutes:02d}:{secs:02d}")
                 if dashboard:
                     dashboard.update_node(
                         ip, node_id, task["part_filename"], PROGRESS_EXECUTING, elapsed
                     )
             else:
-                print(f"{PROGRESS_RECEIVING_FILES} ({ip}, {task['part_filename']})")
+                printlog(f"{PROGRESS_RECEIVING_FILES} ({ip}, {task['part_filename']})")
                 if dashboard:
                     dashboard.update_node(
                         ip, node_id, task["part_filename"], PROGRESS_RECEIVING_FILES
@@ -367,10 +370,10 @@ def monitor_worker_executions_and_collect_results(
                 if msg.get("type") == "finished":
                     task["exec_finished"] = True
                     exec_time = msg.get("execution_time", 0.0)
-                    print(
+                    printlog(
                         f"\n[EXECUTION COMPLETE] Node {ip} finished {task['part_filename']} in {exec_time:.2f}s"
                     )
-                    print(f"{PROGRESS_RECEIVING_FILES} ({ip}, {task['part_filename']})")
+                    printlog(f"{PROGRESS_RECEIVING_FILES} ({ip}, {task['part_filename']})")
                     if dashboard:
                         dashboard.update_node(
                             ip, f"node{task['node_index']}", task["part_filename"], PROGRESS_RECEIVING_FILES
@@ -379,7 +382,7 @@ def monitor_worker_executions_and_collect_results(
                     raise ConnectionError(f"Node reported failure: {msg.get('reason')}")
             except (ConnectionError, OSError, ValueError, KeyError) as exc:
                 if not task["exec_finished"]:
-                    print(f"\n[FAILURE DETECTED] Node {ip} socket error/disconnect: {exc}")
+                    printlog(f"\n[FAILURE DETECTED] Node {ip} socket error/disconnect: {exc}")
                     worker_pool.remove_connection(ip)
 
                     node_index = task["node_index"]
@@ -394,7 +397,7 @@ def monitor_worker_executions_and_collect_results(
                     if retries < 1:
                         # 1 Retry attempt on the same node first
                         node_retries[ip] = retries + 1
-                        print(
+                        printlog(
                             f"\n[RETRY 1/1] Task for node{node_index} failed on {ip}. Attempting retry 1/1 on same node {ip}..."
                         )
 
@@ -402,7 +405,7 @@ def monitor_worker_executions_and_collect_results(
                         try:
                             retry_conn = worker_pool.get_connection(ip, timeout_seconds=8.0)
                         except TimeoutError:
-                            print(f"[RETRY FAILED] Node {ip} did not reconnect within timeout.")
+                            printlog(f"[RETRY FAILED] Node {ip} did not reconnect within timeout.")
 
                         if retry_conn:
                             daemon = distribute_part_file_to_single_node(
@@ -421,7 +424,7 @@ def monitor_worker_executions_and_collect_results(
                                 "exec_finished": False,
                                 "file_received": False,
                             }
-                            print(f"[RETRY 1/1] Resumed execution on same node {ip} ({part_filename})")
+                            printlog(f"[RETRY 1/1] Resumed execution on same node {ip} ({part_filename})")
                             continue
 
                     # If retry attempt failed or retries >= 1, trigger failover to spare node
@@ -442,7 +445,7 @@ def monitor_worker_executions_and_collect_results(
                         "exec_finished": False,
                         "file_received": False,
                     }
-                    print(
+                    printlog(
                         f"{PROGRESS_EXECUTING} resumed for spare worker {spare_ip} ({part_filename_for_node(node_index)})"
                     )
 
@@ -452,7 +455,7 @@ def monitor_worker_executions_and_collect_results(
                 expected_output_file = Path(MASTER_OUTPUT_DIRECTORY) / task["part_filename"]
                 if expected_output_file.is_file():
                     task["file_received"] = True
-                    print(
+                    printlog(
                         f"{PROGRESS_FINISHED} ({ip}, {task['part_filename']}) - result saved to {expected_output_file}"
                     )
                     if dashboard:
@@ -498,7 +501,7 @@ def run_master() -> None:
     print(f"Loaded config from {arguments.config}")
     print(f"Active nodes ({len(active_nodes)}): {', '.join(active_nodes)}")
     print(f"Spare nodes ({len(spare_nodes)}): {', '.join(spare_nodes)}")
-    print(f"Wrote devices.json: {device_mapping}")
+    printlog(f"Wrote devices.json: {device_mapping}")
     print(f"Listening on control port {CONTROL_PORT}...")
 
     listening_socket = open_listening_socket(FIXED_PORT)
@@ -533,7 +536,7 @@ def run_master() -> None:
         )
         daemons.extend(initial_daemons)
 
-        print("\nPhase 2 complete: split files distributed to all active workers.")
+        printlog("\nPhase 2 complete: split files distributed to all active workers.")
 
         # Phase 3 & Phase 4 (Task 4.1): Monitor execution, handle 1-attempt retry & failover
         dashboard.set_master_state("executing")
@@ -547,7 +550,7 @@ def run_master() -> None:
         )
         daemons.extend(failover_daemons)
 
-        print("\nPhase 4 Result Collection complete: all part files received.")
+        printlog("\nAll part files received.")
 
         # Phase 4 (Task 4.2): Merge output part files into single final video
         dashboard.set_master_state("merging files")
@@ -557,7 +560,7 @@ def run_master() -> None:
             output_directory=MASTER_OUTPUT_DIRECTORY,
         )
         dashboard.set_master_state("finished")
-        print("\nAll tasks and merging completed successfully.")
+        printlog("\nAll tasks and merging completed successfully.")
 
     except KeyboardInterrupt:
         print("\nMaster shutting down.")
