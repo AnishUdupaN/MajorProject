@@ -38,6 +38,12 @@ class StatusDashboard:
         }
         self.render()
 
+    def remove_node(self, node_ip: str) -> None:
+        """Remove a node from the active dashboard view."""
+        self.node_states.pop(node_ip, None)
+        self.render()
+
+
     def render(self) -> None:
         """Render formatted CLI dashboard view."""
         header = f"=== MASTER DASHBOARD: [{self.master_state.upper()}] ==="

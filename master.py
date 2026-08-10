@@ -1,9 +1,10 @@
-"""Master node entry point: load config, validate node list, split video, distribute parts, track execution, collect results, and merge."""
+"""Master node entry point: load config, validate addresses, split video, distribute parts, track execution with same-node retries & dynamic pooling, collect results, and merge."""
 
 import argparse
 import select
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -19,16 +20,104 @@ from constants import (
     PROGRESS_SENDING_FILE,
 )
 from control_messages import (
+    has_buffered_message,
     receive_file_received_message,
     receive_json_message,
     send_ready_message,
+    send_shutdown_message,
 )
+
 from devices import swap_device_ip, write_devices_json
 from file_transfer_daemon import FileTransferDaemon, start_file_transfer_daemon
 from merge import run_merge_command
 from network import get_local_ip_for_peer
 from split import part_filename_for_node, run_split_command, verify_part_files
 from ui import StatusDashboard
+
+
+class WorkerConnectionPool:
+    """Thread-safe pool accepting worker connections dynamically at any time."""
+
+    def __init__(
+        self,
+        allowed_ips: list[str],
+        listening_socket: socket.socket,
+        dashboard: StatusDashboard | None = None,
+    ) -> None:
+        self.allowed_ips = set(allowed_ips)
+        self.listening_socket = listening_socket
+        self.dashboard = dashboard
+        self.connections: dict[str, socket.socket] = {}
+        self.lock = threading.Lock()
+        self.running = True
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+
+    def _accept_loop(self) -> None:
+        while self.running:
+            try:
+                r, _, _ = select.select([self.listening_socket], [], [], 0.5)
+                if not r:
+                    continue
+                conn, addr = self.listening_socket.accept()
+                ip = addr[0]
+                if ip not in self.allowed_ips:
+                    conn.close()
+                    continue
+                with self.lock:
+                    old_conn = self.connections.get(ip)
+                    if old_conn is not None and old_conn != conn:
+                        try:
+                            rlist, _, _ = select.select([old_conn], [], [], 0.0)
+                            if rlist:
+                                peek = old_conn.recv(1, socket.MSG_PEEK)
+                                if not peek:
+                                    old_conn.close()
+                        except Exception:
+                            pass
+                    self.connections[ip] = conn
+                    print(f"\n[POOL] Worker {ip}:{addr[1]} connected and kept in IDLE pool.")
+                    if self.dashboard:
+                        existing = self.dashboard.node_states.get(ip)
+                        if not existing or existing.get("node_id") == "worker":
+                            self.dashboard.update_node(ip, "worker", "-", "idle")
+            except Exception:
+                pass
+
+
+
+    def get_connection(self, ip: str, timeout_seconds: float = 30.0) -> socket.socket:
+        """Fetch connection for ip from pool, waiting if not yet connected."""
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            with self.lock:
+                conn = self.connections.get(ip)
+                if conn is not None:
+                    return conn
+            time.sleep(0.2)
+        raise TimeoutError(f"Worker {ip} did not connect within {timeout_seconds}s")
+
+    def remove_connection(self, ip: str) -> None:
+        """Remove a dead or closed socket connection for ip from the pool."""
+        with self.lock:
+            conn = self.connections.pop(ip, None)
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def shutdown_all_workers(self) -> None:
+        """Broadcast shutdown message to all connected workers in the pool."""
+        with self.lock:
+            for ip, conn in list(self.connections.items()):
+                try:
+                    send_shutdown_message(conn)
+                except Exception:
+                    pass
+
+    def stop(self) -> None:
+        self.running = False
 
 
 
@@ -91,59 +180,6 @@ def open_listening_socket(port: int) -> socket.socket:
     return listening_socket
 
 
-def wait_for_single_worker_connection(
-    listening_socket: socket.socket, target_ip_address: str
-) -> socket.socket:
-    """Accept connection from a specific worker IP address (used for active and spare workers)."""
-    print(f"Waiting for worker connection from {target_ip_address}...")
-    while True:
-        connection, address = listening_socket.accept()
-        connected_ip = address[0]
-        if connected_ip == target_ip_address:
-            print(f"Worker connected from {connected_ip}:{address[1]}")
-            return connection
-        print(
-            f"Ignoring connection from non-target address {connected_ip} (expected {target_ip_address})",
-            file=sys.stderr,
-        )
-        connection.close()
-
-
-def wait_for_active_worker_connections(
-    listening_socket: socket.socket, active_nodes: list[str]
-) -> dict[str, socket.socket]:
-    """Accept connections until each active node IP has connected."""
-    worker_connections: dict[str, socket.socket] = {}
-    pending_nodes = set(active_nodes)
-
-    print(f"Waiting for active workers: {', '.join(active_nodes)}")
-
-    while pending_nodes:
-        connection, address = listening_socket.accept()
-        worker_ip_address = address[0]
-        print(f"Worker connected from {worker_ip_address}:{address[1]}")
-
-        if worker_ip_address not in active_nodes:
-            print(
-                f"Ignoring connection from non-active address {worker_ip_address}",
-                file=sys.stderr,
-            )
-            connection.close()
-            continue
-
-        if worker_ip_address in worker_connections:
-            print(
-                f"Replacing existing connection from {worker_ip_address}",
-                file=sys.stderr,
-            )
-            worker_connections[worker_ip_address].close()
-
-        worker_connections[worker_ip_address] = connection
-        pending_nodes.discard(worker_ip_address)
-
-    return worker_connections
-
-
 def distribute_part_file_to_single_node(
     worker_ip_address: str,
     part_filename: str,
@@ -170,7 +206,7 @@ def distribute_part_file_to_single_node(
 
 def distribute_part_files_to_active_nodes(
     active_nodes: list[str],
-    worker_connections: dict[str, socket.socket],
+    worker_pool: WorkerConnectionPool,
     parts_directory: str,
     master_ip_address: str | None = None,
 ) -> list[FileTransferDaemon]:
@@ -189,7 +225,7 @@ def distribute_part_files_to_active_nodes(
         if daemon.port is None:
             raise RuntimeError("File-transfer daemon did not report a listening port")
 
-        connection = worker_connections[worker_ip_address]
+        connection = worker_pool.get_connection(worker_ip_address)
         reachable_master_ip = master_ip_address or get_local_ip_for_peer(
             worker_ip_address
         )
@@ -224,7 +260,7 @@ def reassign_task_to_spare_node(
     failed_ip: str,
     node_index: int,
     spare_nodes: list[str],
-    listening_socket: socket.socket,
+    worker_pool: WorkerConnectionPool,
     parts_directory: str,
     master_ip_address: str | None = None,
 ) -> tuple[str, socket.socket, FileTransferDaemon]:
@@ -236,16 +272,15 @@ def reassign_task_to_spare_node(
 
     spare_ip = spare_nodes.pop(0)
     print(
-        f"\n[FAILOVER] Node {failed_ip} disconnected/failed. Reassigning task for node{node_index} to spare node {spare_ip}..."
+        f"\n[FAILOVER] Node {failed_ip} failed 2 times. Reassigning task for node{node_index} to spare node {spare_ip}..."
     )
 
     updated_mapping = swap_device_ip(failed_ip, spare_ip)
     print(f"[FAILOVER] Updated devices.json: {updated_mapping}")
 
-    spare_connection = wait_for_single_worker_connection(listening_socket, spare_ip)
+    spare_connection = worker_pool.get_connection(spare_ip)
     part_filename = part_filename_for_node(node_index)
 
-    # Reuse the existing split file partN.mkv without re-running split_command.
     print(f"[FAILOVER] Reusing existing split file {part_filename} for spare node {spare_ip}")
     daemon = distribute_part_file_to_single_node(
         spare_ip,
@@ -259,20 +294,21 @@ def reassign_task_to_spare_node(
 
 def monitor_worker_executions_and_collect_results(
     active_nodes: list[str],
-    worker_connections: dict[str, socket.socket],
+    worker_pool: WorkerConnectionPool,
     spare_nodes: list[str],
-    listening_socket: socket.socket,
     parts_directory: str,
     master_ip_address: str | None = None,
     dashboard: StatusDashboard | None = None,
 ) -> list[FileTransferDaemon]:
-    """Track Phase 3 execution and Phase 4 result collection (receiving files -> finished), with failover."""
+    """Track execution and result collection, supporting 1-attempt same-node retry before spare failover."""
     active_tasks: dict[str, dict] = {}
+    node_retries: dict[str, int] = {}
+
     for node_index, worker_ip in enumerate(active_nodes, start=1):
         active_tasks[worker_ip] = {
             "node_index": node_index,
             "part_filename": part_filename_for_node(node_index),
-            "connection": worker_connections[worker_ip],
+            "connection": worker_pool.get_connection(worker_ip),
             "start_time": time.time(),
             "exec_finished": False,
             "file_received": False,
@@ -314,11 +350,17 @@ def monitor_worker_executions_and_collect_results(
             for ip, task in active_tasks.items()
             if not task["file_received"]
         }
-        readable, _, _ = select.select(list(socket_map.keys()), [], [], 1.0)
+        readable, _, _ = select.select(list(socket_map.keys()), [], [], 0.5)
 
-        for sock in readable:
+        socks_to_check = [s for s in socket_map if has_buffered_message(s)]
+        for s in readable:
+            if s not in socks_to_check:
+                socks_to_check.append(s)
+
+        for sock in socks_to_check:
             ip = socket_map[sock]
             task = active_tasks[ip]
+
 
             try:
                 msg = receive_json_message(sock)
@@ -338,15 +380,56 @@ def monitor_worker_executions_and_collect_results(
             except (ConnectionError, OSError, ValueError, KeyError) as exc:
                 if not task["exec_finished"]:
                     print(f"\n[FAILURE DETECTED] Node {ip} socket error/disconnect: {exc}")
-                    sock.close()
-                    node_index = task["node_index"]
-                    del active_tasks[ip]
+                    worker_pool.remove_connection(ip)
 
+                    node_index = task["node_index"]
+                    part_filename = task["part_filename"]
+                    del active_tasks[ip]
+                    if dashboard:
+                        dashboard.update_node(ip, f"node{node_index}", "-", "idle")
+
+
+
+                    retries = node_retries.get(ip, 0)
+                    if retries < 1:
+                        # 1 Retry attempt on the same node first
+                        node_retries[ip] = retries + 1
+                        print(
+                            f"\n[RETRY 1/1] Task for node{node_index} failed on {ip}. Attempting retry 1/1 on same node {ip}..."
+                        )
+
+                        retry_conn = None
+                        try:
+                            retry_conn = worker_pool.get_connection(ip, timeout_seconds=8.0)
+                        except TimeoutError:
+                            print(f"[RETRY FAILED] Node {ip} did not reconnect within timeout.")
+
+                        if retry_conn:
+                            daemon = distribute_part_file_to_single_node(
+                                ip,
+                                part_filename,
+                                retry_conn,
+                                parts_directory,
+                                master_ip_address,
+                            )
+                            active_daemons.append(daemon)
+                            active_tasks[ip] = {
+                                "node_index": node_index,
+                                "part_filename": part_filename,
+                                "connection": retry_conn,
+                                "start_time": time.time(),
+                                "exec_finished": False,
+                                "file_received": False,
+                            }
+                            print(f"[RETRY 1/1] Resumed execution on same node {ip} ({part_filename})")
+                            continue
+
+                    # If retry attempt failed or retries >= 1, trigger failover to spare node
                     spare_ip, spare_conn, daemon = reassign_task_to_spare_node(
                         ip,
                         node_index,
                         spare_nodes,
-                        listening_socket,
+                        worker_pool,
                         parts_directory,
                         master_ip_address,
                     )
@@ -419,12 +502,17 @@ def run_master() -> None:
     print(f"Listening on control port {CONTROL_PORT}...")
 
     listening_socket = open_listening_socket(FIXED_PORT)
+    worker_pool = WorkerConnectionPool(
+        arguments.worker_ip_addresses, listening_socket, dashboard=dashboard
+    )
     daemons: list[FileTransferDaemon] = []
 
+
     try:
-        worker_connections = wait_for_active_worker_connections(
-            listening_socket, active_nodes
-        )
+        print(f"Waiting for active worker connections ({', '.join(active_nodes)})...")
+        for ip in active_nodes:
+            worker_pool.get_connection(ip)
+        print("All active workers connected!")
 
         dashboard.set_master_state("splitting file")
         run_split_command(
@@ -439,7 +527,7 @@ def run_master() -> None:
 
         initial_daemons = distribute_part_files_to_active_nodes(
             active_nodes,
-            worker_connections,
+            worker_pool,
             arguments.parts_directory,
             master_ip_address=arguments.master_ip,
         )
@@ -447,12 +535,12 @@ def run_master() -> None:
 
         print("\nPhase 2 complete: split files distributed to all active workers.")
 
-        # Phase 3 & Phase 4 (Task 4.1): Monitor execution, handle failover, and collect result files
+        # Phase 3 & Phase 4 (Task 4.1): Monitor execution, handle 1-attempt retry & failover
+        dashboard.set_master_state("executing")
         failover_daemons = monitor_worker_executions_and_collect_results(
             active_nodes,
-            worker_connections,
+            worker_pool,
             spare_nodes,
-            listening_socket,
             arguments.parts_directory,
             master_ip_address=arguments.master_ip,
             dashboard=dashboard,
@@ -469,6 +557,7 @@ def run_master() -> None:
             output_directory=MASTER_OUTPUT_DIRECTORY,
         )
         dashboard.set_master_state("finished")
+        print("\nAll tasks and merging completed successfully.")
 
     except KeyboardInterrupt:
         print("\nMaster shutting down.")
@@ -476,10 +565,22 @@ def run_master() -> None:
         print(f"Master error: {exc}", file=sys.stderr)
         sys.exit(1)
     finally:
+        if 'worker_pool' in locals() and worker_pool:
+            try:
+                worker_pool.shutdown_all_workers()
+            except Exception:
+                pass
+            worker_pool.stop()
         for daemon in daemons:
-            daemon.stop()
-        listening_socket.close()
-
+            try:
+                daemon.stop()
+            except Exception:
+                pass
+        if 'listening_socket' in locals() and listening_socket:
+            try:
+                listening_socket.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

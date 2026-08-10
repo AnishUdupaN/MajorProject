@@ -89,6 +89,10 @@ def force_stop_process(process: subprocess.Popen) -> None:
 
 def check_socket_connection_lost(connection: socket.socket) -> bool:
     """Check if the control socket connection to the master node has been lost/closed."""
+    from control_messages import _SOCKET_BUFFERS
+
+    if _SOCKET_BUFFERS.get(connection, ""):
+        return False
     try:
         rlist, _, _ = select.select([connection], [], [], 0.0)
         if rlist:
@@ -98,6 +102,7 @@ def check_socket_connection_lost(connection: socket.socket) -> bool:
     except (OSError, ConnectionError):
         return True
     return False
+
 
 
 def _stderr_reader_thread(process: subprocess.Popen, state: dict, input_file: str) -> None:

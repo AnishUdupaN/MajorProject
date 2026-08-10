@@ -8,7 +8,17 @@ from constants import (
     MESSAGE_TYPE_FILE_RECEIVED,
     MESSAGE_TYPE_FINISHED,
     MESSAGE_TYPE_READY,
+    MESSAGE_TYPE_SHUTDOWN,
 )
+
+
+class MasterShutdownError(Exception):
+    """Raised when master sends a shutdown message to worker nodes."""
+
+    pass
+
+
+_SOCKET_BUFFERS: dict[socket.socket, str] = {}
 
 
 def send_json_message(connection: socket.socket, message: dict) -> None:
@@ -18,15 +28,28 @@ def send_json_message(connection: socket.socket, message: dict) -> None:
 
 
 def receive_json_message(connection: socket.socket) -> dict:
-    """Receive one JSON control message from the connection."""
-    buffer = ""
-    while "\n" not in buffer:
+    """Receive one JSON control message from the connection, buffering extra lines."""
+    buf = _SOCKET_BUFFERS.get(connection, "")
+    while "\n" not in buf:
         chunk = connection.recv(4096)
         if not chunk:
+            _SOCKET_BUFFERS.pop(connection, None)
             raise ConnectionError("Control connection closed before message was received")
-        buffer += chunk.decode("utf-8")
-    line, _remainder = buffer.split("\n", 1)
+        buf += chunk.decode("utf-8")
+
+    line, remainder = buf.split("\n", 1)
+    _SOCKET_BUFFERS[connection] = remainder
     return json.loads(line)
+
+
+def has_buffered_message(connection: socket.socket) -> bool:
+    """Return True if an unread newline-terminated message is buffered for this socket."""
+    return "\n" in _SOCKET_BUFFERS.get(connection, "")
+
+
+def send_shutdown_message(connection: socket.socket) -> None:
+    """Master sends a shutdown message to worker nodes to signal clean termination."""
+    send_json_message(connection, {"type": MESSAGE_TYPE_SHUTDOWN})
 
 
 def send_ready_message(
@@ -46,6 +69,8 @@ def send_ready_message(
 def receive_ready_message(connection: socket.socket) -> dict:
     """Worker receives the ready message from the master."""
     message = receive_json_message(connection)
+    if message.get("type") == MESSAGE_TYPE_SHUTDOWN:
+        raise MasterShutdownError("Master sent shutdown signal")
     if message.get("type") != MESSAGE_TYPE_READY:
         raise ValueError(f"Expected ready message, got: {message!r}")
     return message
