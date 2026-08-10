@@ -112,10 +112,11 @@ def run_failover_demo() -> None:
     ]
     spare_proc = subprocess.Popen(spare_cmd, cwd=PROJECT_DIR)
 
-    # 7. Wait for completion
-    master_code = master_proc.wait(timeout=20)
-    worker1_proc.wait(timeout=5)
-    spare_proc.wait(timeout=5)
+    master_code = master_proc.wait(timeout=30)
+    for p in [worker1_proc, worker2_proc, spare_proc]:
+        if p and p.poll() is None:
+            p.terminate()
+
 
     print("\n==================================================================")
     print("                    DEMO EXECUTION SUMMARY                        ")
