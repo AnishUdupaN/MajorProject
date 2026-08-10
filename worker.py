@@ -167,7 +167,7 @@ def run_worker() -> None:
     Path(arguments.download_directory).mkdir(parents=True, exist_ok=True)
     Path(WORKER_OUTPUT_DIRECTORY).mkdir(parents=True, exist_ok=True)
 
-    print("Tip: While executing, press 'k' at any time to kill the task and simulate a node drop.")
+    print("Press 'k' to kill the task.")
 
     connection = None
     simulate_fail = arguments.simulate_failure_after

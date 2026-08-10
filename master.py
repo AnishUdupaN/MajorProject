@@ -33,16 +33,15 @@ from core import (
     swap_device_ip,
     verify_part_files,
     write_devices_json,
+    printlog
 )
 
+# clean the old log file
 f=open("logs.txt","w")
 f.write("")
 f.close()
 
-def printlog(st):
-    f=open("logs.txt","a+")
-    f.write(st+"\n")
-    f.close()
+
 
 class WorkerConnectionPool:
     """Thread-safe pool accepting worker connections dynamically at any time."""

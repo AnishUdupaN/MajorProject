@@ -85,6 +85,10 @@ class Config:
     merge_command: str
     max_nodes: int
 
+def printlog(st):
+    f=open("logs.txt","a+")
+    f.write(st+"\n")
+    f.close()
 
 def load_config(config_path: str) -> Config:
     path = Path(config_path)
@@ -1090,6 +1094,7 @@ class StatusDashboard:
         self.render()
 
     def render(self) -> None:
+        os.system("clear")
         """Render formatted CLI dashboard view."""
         header = f"=== MASTER DASHBOARD: [{self.master_state.upper()}] ==="
         divider = "=" * len(header)
@@ -1124,6 +1129,7 @@ class StatusDashboard:
                 )
 
         lines.append(divider)
+        printlog("\n".join(lines)+"\n")
         print("\n".join(lines))
 
 
