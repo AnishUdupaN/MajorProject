@@ -1,6 +1,7 @@
 """Worker node entry point: connect to master, download part file, execute task, and send finished signal."""
 
 import argparse
+import signal
 import socket
 import sys
 import time
@@ -18,6 +19,7 @@ from core import (
     Config,
     MasterShutdownError,
     MdnsAnnouncer,
+    cleanup_worker_temporary_files,
     discover_master_ip,
     load_config,
     receive_ready_message,
@@ -118,48 +120,68 @@ def run_worker_task(
     config: Config | None = None,
 ) -> None:
     """Handle ready message, fetch allocated part file, run execute_command, send finished signal, and upload result."""
-    ready_message = receive_ready_message(connection)
-    file_transfer_port = ready_message["file_transfer_port"]
-
-    downloaded_path = fetch_allocated_part_file(
-        master_ip_address,
-        file_transfer_port,
-        download_directory,
-    )
-    print(f"Downloaded part file to {downloaded_path}")
-
-    send_file_received_message(connection)
-
-    # Phase 3 & 4: Execute task on the downloaded part file.
-    # Force-stops process if connection is lost or user presses 'k'.
+    downloaded_path = None
+    output_filepath = None
     try:
-        elapsed_time = run_execute_command(
-            execute_command_template,
-            input_file=downloaded_path,
-            output_directory=WORKER_OUTPUT_DIRECTORY,
-            connection=connection,
-            simulate_failure_after=simulate_failure_after,
-            config=config,
+        ready_message = receive_ready_message(connection)
+        file_transfer_port = ready_message["file_transfer_port"]
+
+        downloaded_path = fetch_allocated_part_file(
+            master_ip_address,
+            file_transfer_port,
+            download_directory,
         )
-    except (KeyboardInterrupt, RuntimeError, ValueError) as exc:
+        print(f"Downloaded part file to {downloaded_path}")
+
+        send_file_received_message(connection)
+
+        # Phase 3 & 4: Execute task on the downloaded part file.
+        # Force-stops process if connection is lost or user presses 'k'.
         try:
-            send_failed_message(connection, str(exc))
-        except Exception:
-            pass
-        raise
+            elapsed_time = run_execute_command(
+                execute_command_template,
+                input_file=downloaded_path,
+                output_directory=WORKER_OUTPUT_DIRECTORY,
+                connection=connection,
+                simulate_failure_after=simulate_failure_after,
+                config=config,
+            )
+        except (KeyboardInterrupt, RuntimeError, ValueError) as exc:
+            try:
+                send_failed_message(connection, str(exc))
+            except Exception:
+                pass
+            raise
 
-    part_filename = Path(downloaded_path).name
-    output_filepath = Path(WORKER_OUTPUT_DIRECTORY) / part_filename
+        part_filename = Path(downloaded_path).name
+        output_filepath = Path(WORKER_OUTPUT_DIRECTORY) / part_filename
 
-    # Phase 4 Task 4.1: Upload completed output file back to Master's per-node file-transfer daemon FIRST
-    if output_filepath.is_file():
-        upload_result_file(master_ip_address, file_transfer_port, str(output_filepath))
-        print(f"Uploaded result {part_filename} to master daemon on port {file_transfer_port}")
+        # Phase 4 Task 4.1: Upload completed output file back to Master's per-node file-transfer daemon FIRST
+        if output_filepath.is_file():
+            upload_result_file(master_ip_address, file_transfer_port, str(output_filepath))
+            print(f"Uploaded result {part_filename} to master daemon on port {file_transfer_port}")
 
-    # Send finished signal to Master over control port AFTER upload completes
-    send_finished_message(connection, elapsed_time, part_filename)
+        # Send finished signal to Master over control port AFTER upload completes
+        send_finished_message(connection, elapsed_time, part_filename)
 
-    print(f"{PROGRESS_FINISHED} for worker ({part_filename})")
+        print(f"{PROGRESS_FINISHED} for worker ({part_filename})")
+    finally:
+        if downloaded_path:
+            try:
+                p = Path(downloaded_path)
+                if p.is_file():
+                    p.unlink()
+                    printlog(f"Cleaned up worker downloaded part file: {downloaded_path}")
+            except Exception:
+                pass
+        if output_filepath:
+            try:
+                p = Path(output_filepath)
+                if p.is_file():
+                    p.unlink()
+                    printlog(f"Cleaned up worker output part file: {output_filepath}")
+            except Exception:
+                pass
 
 
 
@@ -203,83 +225,108 @@ def run_worker() -> None:
     reconnect_start_time: float | None = None
     max_reconnect_timeout = arguments.reconnect_timeout
 
-    while True:
-        if connection is None:
-            if reconnect_start_time is None:
-                reconnect_start_time = time.time()
-            elif time.time() - reconnect_start_time >= max_reconnect_timeout:
-                print(
-                    f"\nMaster at {master_ip_address}:{FIXED_PORT} unreachable for {max_reconnect_timeout:.0f}s. Exiting safely.",
-                    file=sys.stderr,
-                )
-                sys.exit(0)
+    active_conn_ref: list[socket.socket | None] = [None]
 
-            print(f"\nConnecting to master at {master_ip_address}:{FIXED_PORT}...")
+    def _worker_sig_handler(signum, frame):
+        print(f"\nReceived signal {signum}. Cleaning up worker temporary files and exiting...", file=sys.stderr)
+        if active_conn_ref[0]:
             try:
-                connection = connect_to_master(
-                    master_ip_address, FIXED_PORT, bind_ip=arguments.bind_ip
+                active_conn_ref[0].close()
+            except Exception:
+                pass
+        cleanup_worker_temporary_files(arguments.download_directory, WORKER_OUTPUT_DIRECTORY)
+        sys.exit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _worker_sig_handler)
+        signal.signal(signal.SIGINT, _worker_sig_handler)
+    except Exception:
+        pass
+
+    try:
+        while True:
+            if connection is None:
+                if reconnect_start_time is None:
+                    reconnect_start_time = time.time()
+                elif time.time() - reconnect_start_time >= max_reconnect_timeout:
+                    print(
+                        f"\nMaster at {master_ip_address}:{FIXED_PORT} unreachable for {max_reconnect_timeout:.0f}s. Exiting safely.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(0)
+
+                print(f"\nConnecting to master at {master_ip_address}:{FIXED_PORT}...")
+                try:
+                    connection = connect_to_master(
+                        master_ip_address, FIXED_PORT, bind_ip=arguments.bind_ip
+                    )
+                    active_conn_ref[0] = connection
+                    print("Connected to master. Node state: IDLE. Waiting for task assignment...")
+                    # VULN-08: Send shared secret for authentication if configured
+                    if shared_secret:
+                        send_auth_message(connection, shared_secret)
+                    reconnect_start_time = None
+                except OSError as exc:
+                    print(f"Connection attempt failed ({exc}). Retrying in 2 seconds...", file=sys.stderr)
+                    time.sleep(2.0)
+                    continue
+
+            try:
+                # Wait for ready message or disconnection check
+                current_sim_fail = simulate_fail
+                simulate_fail = None  # One-shot simulation flag: consume immediately
+                run_worker_task(
+                    connection,
+                    master_ip_address,
+                    arguments.download_directory,
+                    config.execute_command,
+                    simulate_failure_after=current_sim_fail,
+                    config=config,
                 )
-                print("Connected to master. Node state: IDLE. Waiting for task assignment...")
-                # VULN-08: Send shared secret for authentication if configured
-                if shared_secret:
-                    send_auth_message(connection, shared_secret)
-                reconnect_start_time = None
-            except OSError as exc:
-                print(f"Connection attempt failed ({exc}). Retrying in 2 seconds...", file=sys.stderr)
-                time.sleep(2.0)
-                continue
+                print("Task completed. Node returning to IDLE state. Waiting for next task...")
 
-        try:
-            # Wait for ready message or disconnection check
-            current_sim_fail = simulate_fail
-            simulate_fail = None  # One-shot simulation flag: consume immediately
-            run_worker_task(
-                connection,
-                master_ip_address,
-                arguments.download_directory,
-                config.execute_command,
-                simulate_failure_after=current_sim_fail,
-                config=config,
-            )
-            print("Task completed. Node returning to IDLE state. Waiting for next task...")
-
-        except MasterShutdownError:
-            print("\nMaster completed processing and initiated shutdown. Exiting safely.")
-            if connection:
-                try:
-                    connection.close()
-                except Exception:
-                    pass
-            sys.exit(0)
-        except KeyboardInterrupt as exc:
-            print(f"\nTask aborted by user ('k' key / interrupt): {exc}")
-            if connection:
-                try:
-                    connection.close()
-                except Exception:
-                    pass
-            connection = None
-            simulate_fail = None
-            print("Node state: IDLE. Reconnecting to master...")
-            time.sleep(0.5)
-        except (ConnectionError, OSError) as exc:
-            print(f"\nControl socket disconnected ({exc}). Reconnecting to master...", file=sys.stderr)
-            if connection:
-                try:
-                    connection.close()
-                except Exception:
-                    pass
-            connection = None
-            time.sleep(1.0)
-        except (RuntimeError, ValueError) as exc:
-            print(f"\nTask error ({exc}). Reconnecting to master...", file=sys.stderr)
-            if connection:
-                try:
-                    connection.close()
-                except Exception:
-                    pass
-            connection = None
-            time.sleep(1.0)
+            except MasterShutdownError:
+                print("\nMaster completed processing and initiated shutdown. Exiting safely.")
+                if connection:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+                sys.exit(0)
+            except KeyboardInterrupt as exc:
+                print(f"\nTask aborted by user ('k' key / interrupt): {exc}")
+                if connection:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+                connection = None
+                active_conn_ref[0] = None
+                simulate_fail = None
+                print("Node state: IDLE. Reconnecting to master...")
+                time.sleep(0.5)
+            except (ConnectionError, OSError) as exc:
+                print(f"\nControl socket disconnected ({exc}). Reconnecting to master...", file=sys.stderr)
+                if connection:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+                connection = None
+                active_conn_ref[0] = None
+                time.sleep(1.0)
+            except (RuntimeError, ValueError) as exc:
+                print(f"\nTask error ({exc}). Reconnecting to master...", file=sys.stderr)
+                if connection:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+                connection = None
+                active_conn_ref[0] = None
+                time.sleep(1.0)
+    finally:
+        cleanup_worker_temporary_files(arguments.download_directory, WORKER_OUTPUT_DIRECTORY)
 
 
 

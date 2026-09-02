@@ -2,6 +2,7 @@
 
 import argparse
 import select
+import signal
 import socket
 import sys
 import threading
@@ -23,6 +24,7 @@ from core import (
     FileTransferDaemon,
     MdnsAnnouncer,
     StatusDashboard,
+    cleanup_master_temporary_files,
     get_local_ip_for_peer,
     has_buffered_message,
     load_config,
@@ -62,11 +64,33 @@ class WorkerConnectionPool:
         self.listening_socket = listening_socket
         self.dashboard = dashboard
         self.connections: dict[str, socket.socket] = {}
+        self.killed_ips: set[str] = set()
         self.lock = threading.Lock()
         self.running = True
         self._shared_secret = get_shared_secret()
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
+
+    def mark_killed(self, ip: str) -> None:
+        """Mark a worker IP as permanently killed after failover so reconnects are rejected."""
+        with self.lock:
+            self.killed_ips.add(ip)
+            conn = self.connections.pop(ip, None)
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if self.dashboard:
+                existing = self.dashboard.node_states.get(ip, {})
+                node_id = existing.get("node_id", "worker")
+                if "(killed)" not in node_id:
+                    node_id = f"{node_id} (killed)"
+                filename = existing.get("filename", "-")
+                self.dashboard.update_node(
+                    ip, node_id, filename, "killed",
+                    receiving=False, executing=False, sending=False, connected=False
+                )
 
     def _accept_loop(self) -> None:
         while self.running:
@@ -86,6 +110,16 @@ class WorkerConnectionPool:
                         conn.close()
                         continue
                 with self.lock:
+                    if ip in self.killed_ips or (
+                        self.dashboard
+                        and (
+                            self.dashboard.node_states.get(ip, {}).get("state") == "killed"
+                            or "(killed)" in self.dashboard.node_states.get(ip, {}).get("node_id", "")
+                        )
+                    ):
+                        printlog(f"Worker {ip}:{addr[1]} is KILLED. Rejecting reconnect.")
+                        conn.close()
+                        continue
                     old_conn = self.connections.get(ip)
                     if old_conn is not None and old_conn != conn:
                         try:
@@ -99,9 +133,20 @@ class WorkerConnectionPool:
                     self.connections[ip] = conn
                     printlog(f"\nWorker {ip}:{addr[1]} connected, kept IDLE.")
                     if self.dashboard:
-                        existing = self.dashboard.node_states.get(ip)
-                        if not existing or existing.get("node_id") == "worker":
-                            self.dashboard.update_node(ip, "worker", "-", "idle")
+                        existing = self.dashboard.node_states.get(ip, {})
+                        node_id = existing.get("node_id", "worker")
+                        filename = existing.get("filename", "-")
+                        was_connected = existing.get("connected", False) if existing else False
+                        state = existing.get("state", "idle")
+                        if state in ("disconnected", "killed") or not was_connected:
+                            state = "idle"
+                        self.dashboard.update_node(
+                            ip, node_id, filename, state,
+                            receiving=False, executing=False, sending=False, connected=True
+                        )
+                        if not existing or not was_connected:
+                            msg_action = "reconnected" if (existing and not was_connected) else "connected"
+                            self.dashboard.add_message(f"Node {ip} {msg_action} ({node_id})", timeout_seconds=5)
             except Exception:
                 pass
 
@@ -125,6 +170,14 @@ class WorkerConnectionPool:
                     conn.close()
                 except Exception:
                     pass
+            if self.dashboard:
+                existing = self.dashboard.node_states.get(ip, {})
+                node_id = existing.get("node_id", "worker")
+                filename = existing.get("filename", "-")
+                self.dashboard.update_node(
+                    ip, node_id, filename, "disconnected",
+                    receiving=False, executing=False, sending=False, connected=False
+                )
 
     def shutdown_all_workers(self) -> None:
         """Broadcast shutdown message to all connected workers in the pool."""
@@ -458,11 +511,24 @@ def reassign_task_to_spare_node(
 
     if spare_ip:
         printlog(f"\n Node {failed_ip} failed. Reassigning task to node{node_index}, {spare_ip}")
+        worker_pool.mark_killed(failed_ip)
         updated_mapping = swap_device_ip(failed_ip, spare_ip)
         printlog(f"[FAILOVER] Updated devices.json: {updated_mapping}")
 
+        if dashboard:
+            dashboard.update_node(
+                failed_ip, f"node{node_index} (killed)", "-", "killed",
+                receiving=False, executing=False, sending=False, connected=False
+            )
+
         spare_connection = worker_pool.get_connection(spare_ip)
         part_filename = part_filename_for_node(node_index)
+
+        if dashboard:
+            dashboard.update_node(
+                spare_ip, f"node{node_index}", part_filename, "assigned",
+                receiving=False, executing=False, sending=False, connected=True
+            )
 
         printlog(f"[FAILOVER] Reusing existing split file {part_filename} for spare node {spare_ip}")
         daemon = distribute_part_file_to_single_node(
@@ -698,11 +764,42 @@ def run_master() -> None:
     print(f"Loaded config from {arguments.config}")
     print(f"Listening on control port {CONTROL_PORT}...")
 
+    daemons: list[FileTransferDaemon] = []
     listening_socket = open_listening_socket(FIXED_PORT)
     worker_pool = WorkerConnectionPool(
         arguments.worker_ip_addresses, listening_socket, dashboard=dashboard
     )
-    daemons: list[FileTransferDaemon] = []
+
+    def _master_sig_handler(signum, frame):
+        print(f"\nReceived signal {signum}. Cleaning up master temporary files and exiting...", file=sys.stderr)
+        if worker_pool:
+            try:
+                worker_pool.shutdown_all_workers()
+                worker_pool.stop()
+            except Exception:
+                pass
+        for daemon in daemons:
+            try:
+                daemon.stop()
+            except Exception:
+                pass
+        if listening_socket:
+            try:
+                listening_socket.close()
+            except Exception:
+                pass
+        cleanup_master_temporary_files(
+            parts_directory=arguments.parts_directory,
+            output_directory=MASTER_OUTPUT_DIRECTORY,
+            input_video=arguments.input_video,
+        )
+        sys.exit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _master_sig_handler)
+        signal.signal(signal.SIGINT, _master_sig_handler)
+    except Exception:
+        pass
 
     if arguments.worker_ip_addresses:
         active_nodes, spare_nodes = split_active_and_spare_addresses(
@@ -796,6 +893,19 @@ def run_master() -> None:
     print(f"Spare nodes ({len(spare_nodes)}): {', '.join(spare_nodes)}")
     printlog(f"Wrote devices.json: {device_mapping}")
 
+    for idx, ip in enumerate(active_nodes, start=1):
+        is_conn = ip in worker_pool.connections
+        dashboard.update_node(
+            ip, f"node{idx}", "-", "idle" if is_conn else "disconnected",
+            connected=is_conn
+        )
+    for ip in spare_nodes:
+        is_conn = ip in worker_pool.connections
+        dashboard.update_node(
+            ip, "spare", "-", "idle" if is_conn else "disconnected",
+            connected=is_conn
+        )
+
 
     try:
         print(f"Waiting for active worker connections ({', '.join(active_nodes)})...")
@@ -880,6 +990,11 @@ def run_master() -> None:
                 listening_socket.close()
             except Exception:
                 pass
+        cleanup_master_temporary_files(
+            parts_directory=arguments.parts_directory,
+            output_directory=MASTER_OUTPUT_DIRECTORY,
+            input_video=arguments.input_video,
+        )
 
 
 if __name__ == "__main__":

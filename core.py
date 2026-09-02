@@ -4,6 +4,7 @@ HTTP file transfers, task execution monitoring, video splitting/merging, and UI 
 """
 
 import argparse
+import atexit
 import configparser
 import json
 import os
@@ -11,6 +12,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -713,6 +715,20 @@ DAEMON_READY_TIMEOUT_SECONDS = 10.0
 DAEMON_LISTENING_PREFIX = "LISTENING "
 
 
+_active_daemons_registry: set["FileTransferDaemon"] = set()
+
+
+def _cleanup_all_daemons() -> None:
+    for daemon in list(_active_daemons_registry):
+        try:
+            daemon.stop()
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_all_daemons)
+
+
 class FileTransferDaemon:
     """Serve one node's allocated file(s) over HTTP on an ephemeral port."""
 
@@ -746,14 +762,26 @@ class FileTransferDaemon:
             text=True,
         )
 
+        _active_daemons_registry.add(self)
+
         self.port = read_daemon_port(self._process)
         wait_for_daemon_port(self._process, self.port)
 
     def stop(self) -> None:
         """Stop this node's file-transfer daemon process."""
+        _active_daemons_registry.discard(self)
         if self._process is not None and self._process.poll() is None:
-            self._process.terminate()
-            self._process.wait(timeout=5)
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=2)
+            except Exception:
+                pass
+            if self._process.poll() is None:
+                try:
+                    self._process.kill()
+                    self._process.wait(timeout=2)
+                except Exception:
+                    pass
 
 
 def _make_handler_class(
@@ -903,6 +931,16 @@ def wait_for_daemon_port(
     )
 
 
+def _parent_watchdog(parent_pid: int, server: HTTPServer) -> None:
+    """Watchdog thread that shuts down the server if parent process dies."""
+    while True:
+        time.sleep(1.0)
+        current_ppid = os.getppid()
+        if parent_pid != 1 and current_ppid != parent_pid:
+            server.shutdown()
+            break
+
+
 def run_file_transfer_daemon(
     allocated_filenames: list[str],
     serve_directory: str,
@@ -915,9 +953,19 @@ def run_file_transfer_daemon(
     )
     server = HTTPServer(("0.0.0.0", 0), handler_class)
     port = server.server_address[1]
+
+    parent_pid = os.getppid()
+    watchdog = threading.Thread(
+        target=_parent_watchdog, args=(parent_pid, server), daemon=True
+    )
+    watchdog.start()
+
     sys.stdout.write(f"{DAEMON_LISTENING_PREFIX}{port}\n")
     sys.stdout.flush()
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 def start_file_transfer_daemon(
@@ -1692,6 +1740,67 @@ def run_merge_command(
     return str(final_output_path)
 
 
+def cleanup_master_temporary_files(
+    parts_directory: str = MASTER_INPUT_DIRECTORY,
+    output_directory: str = MASTER_OUTPUT_DIRECTORY,
+    input_video: Optional[str] = None,
+) -> None:
+    """Clean up temporary split and intermediate part files on master node."""
+    input_path = Path(input_video).resolve() if input_video else None
+
+    # Clean temporary split part files in parts_directory
+    parts_dir = Path(parts_directory)
+    if parts_dir.is_dir():
+        for file_path in parts_dir.iterdir():
+            if file_path.is_file():
+                try:
+                    resolved = file_path.resolve()
+                    if input_path and resolved == input_path:
+                        continue
+                    if file_path.name.startswith(PART_FILENAME_PREFIX) or file_path.name.startswith("part"):
+                        file_path.unlink()
+                        printlog(f"Cleaned up temporary master part file: {file_path}")
+                except Exception as exc:
+                    printlog(f"Failed to delete {file_path}: {exc}")
+
+    # Clean intermediate received part files in output_directory
+    out_dir = Path(output_directory)
+    if out_dir.is_dir():
+        for file_path in out_dir.iterdir():
+            if file_path.is_file():
+                try:
+                    if file_path.name.startswith(PART_FILENAME_PREFIX) or file_path.name.startswith("part"):
+                        file_path.unlink()
+                        printlog(f"Cleaned up temporary master output part file: {file_path}")
+                except Exception as exc:
+                    printlog(f"Failed to delete {file_path}: {exc}")
+
+    # Clean temporary filelist.txt files if present
+    for fl in (Path("filelist.txt"), Path(output_directory) / "filelist.txt"):
+        if fl.is_file():
+            try:
+                fl.unlink()
+            except Exception:
+                pass
+
+
+def cleanup_worker_temporary_files(
+    download_directory: str = WORKER_INPUT_DIRECTORY,
+    output_directory: str = WORKER_OUTPUT_DIRECTORY,
+) -> None:
+    """Clean up downloaded and processed part files on worker node."""
+    for dir_path_str in (download_directory, output_directory):
+        dir_path = Path(dir_path_str)
+        if dir_path.is_dir():
+            for file_path in dir_path.iterdir():
+                if file_path.is_file():
+                    try:
+                        file_path.unlink()
+                        printlog(f"Cleaned up temporary worker file: {file_path}")
+                    except Exception as exc:
+                        printlog(f"Failed to delete {file_path}: {exc}")
+
+
 # ==============================================================================
 # SECTION 11: MASTER CLI STATUS DASHBOARD
 # ==============================================================================
@@ -1751,6 +1860,7 @@ class StatusDashboard:
         receiving: bool | None = None,
         executing: bool | None = None,
         sending: bool | None = None,
+        connected: bool | None = None,
     ) -> None:
         """Update individual worker node state and flags."""
         with self.lock:
@@ -1758,6 +1868,7 @@ class StatusDashboard:
             rcv = receiving if receiving is not None else existing.get("receiving", False)
             exc = executing if executing is not None else existing.get("executing", False)
             snd = sending if sending is not None else existing.get("sending", False)
+            conn = connected if connected is not None else existing.get("connected", True)
 
             self.node_states[node_ip] = {
                 "node_id": node_id,
@@ -1769,8 +1880,25 @@ class StatusDashboard:
                 "receiving": rcv,
                 "executing": exc,
                 "sending": snd,
+                "connected": conn,
             }
             self._render_unlocked()
+
+    def set_node_connected(
+        self, node_ip: str, connected: bool, state: str | None = None
+    ) -> None:
+        """Update connection status of a node."""
+        with self.lock:
+            if node_ip in self.node_states:
+                self.node_states[node_ip]["connected"] = connected
+                if not connected:
+                    self.node_states[node_ip]["state"] = state or "disconnected"
+                    self.node_states[node_ip]["receiving"] = False
+                    self.node_states[node_ip]["executing"] = False
+                    self.node_states[node_ip]["sending"] = False
+                elif state:
+                    self.node_states[node_ip]["state"] = state
+                self._render_unlocked()
 
     def remove_node(self, node_ip: str) -> None:
         """Remove a node from the active dashboard view."""
@@ -1798,13 +1926,13 @@ class StatusDashboard:
         os.system("clear")
         """Render formatted CLI dashboard view."""
         header = f"=== MASTER DASHBOARD: [{self.master_state.upper()}] ==="
-        divider = "=" * len(header)
+        divider = "=" * (len(header) + 12)
 
         lines = ["", divider, header, divider]
         lines.append(
-            f"{'NODE IP':<16} {'DEVICE':<10} {'PART FILE':<12} {'STATE':<24} {'FLAGS [R/E/S]':<14} {'PROGRESS / RUN TIME'}"
+            f"{'NODE IP':<16} {'DEVICE':<10} {'CONNECTED':<11} {'PART FILE':<12} {'STATE':<20} {'FLAGS [R/E/S]':<14} {'PROGRESS / RUN TIME'}"
         )
-        lines.append("-" * len(header))
+        lines.append("-" * (len(header) + 12))
 
         if not self.node_states:
             lines.append("  (Waiting for worker connections...)")
@@ -1814,6 +1942,7 @@ class StatusDashboard:
                 elapsed = info["elapsed"]
                 pct = info["pct"]
                 eta = info["eta"]
+                conn_str = "YES" if info.get("connected", True) else "NO"
                 rcv = "R" if info.get("receiving") else "-"
                 exc = "E" if info.get("executing") else "-"
                 snd = "S" if info.get("sending") else "-"
@@ -1830,7 +1959,7 @@ class StatusDashboard:
 
                 prog_str = " ".join(prog_parts)
                 lines.append(
-                    f"{ip:<16} {info['node_id']:<10} {info['filename']:<12} {state_str:<24} {flags_str:<14} {prog_str}"
+                    f"{ip:<16} {info['node_id']:<10} {conn_str:<11} {info['filename']:<12} {state_str:<20} {flags_str:<14} {prog_str}"
                 )
 
         if self.messages:
