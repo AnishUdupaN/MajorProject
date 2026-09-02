@@ -24,6 +24,8 @@ from core import (
     request_file,
     request_file_list,
     run_execute_command,
+    get_shared_secret,
+    send_auth_message,
     send_failed_message,
     send_file_received_message,
     send_finished_message,
@@ -173,6 +175,8 @@ def run_worker() -> None:
         print(f"Config error: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    shared_secret = get_shared_secret()
+
     # worker/input holds downloaded parts; worker/output holds processed results.
     Path(arguments.download_directory).mkdir(parents=True, exist_ok=True)
     Path(WORKER_OUTPUT_DIRECTORY).mkdir(parents=True, exist_ok=True)
@@ -216,6 +220,9 @@ def run_worker() -> None:
                     master_ip_address, FIXED_PORT, bind_ip=arguments.bind_ip
                 )
                 print("Connected to master. Node state: IDLE. Waiting for task assignment...")
+                # VULN-08: Send shared secret for authentication if configured
+                if shared_secret:
+                    send_auth_message(connection, shared_secret)
                 reconnect_start_time = None
             except OSError as exc:
                 print(f"Connection attempt failed ({exc}). Retrying in 2 seconds...", file=sys.stderr)

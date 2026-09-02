@@ -37,7 +37,9 @@ from core import (
     swap_device_ip,
     verify_part_files,
     write_devices_json,
-    printlog
+    printlog,
+    get_shared_secret,
+    verify_auth_message
 )
 
 # clean the old log file
@@ -62,6 +64,7 @@ class WorkerConnectionPool:
         self.connections: dict[str, socket.socket] = {}
         self.lock = threading.Lock()
         self.running = True
+        self._shared_secret = get_shared_secret()
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
 
@@ -76,6 +79,12 @@ class WorkerConnectionPool:
                 if self.allowed_ips and ip not in self.allowed_ips:
                     conn.close()
                     continue
+                # VULN-07: Verify shared secret if configured
+                if self._shared_secret:
+                    if not verify_auth_message(conn, self._shared_secret):
+                        printlog(f"Worker {ip}:{addr[1]} failed authentication. Rejecting.")
+                        conn.close()
+                        continue
                 with self.lock:
                     old_conn = self.connections.get(ip)
                     if old_conn is not None and old_conn != conn:
@@ -147,6 +156,11 @@ def parse_master_arguments() -> argparse.Namespace:
         help="IP address workers should use to reach this master (auto-detected if omitted)",
     )
     parser.add_argument(
+        "--input-video",
+        default=None,
+        help="Path to input video file (default: auto-detected from split_command or master/input/)",
+    )
+    parser.add_argument(
         "--parts-directory",
         default=MASTER_INPUT_DIRECTORY,
         help=f"Directory where split part files are written and served (default: {MASTER_INPUT_DIRECTORY})",
@@ -170,15 +184,14 @@ def split_active_and_spare_addresses(
 
 
 def validate_worker_address_count(
-    worker_ip_addresses: list[str] | None, max_nodes: int
+    worker_ip_addresses: list[str] | None, min_devices: int
 ) -> None:
-    """Reject startup if manual worker IPs are given but fewer than max_nodes + 1."""
+    """Reject startup if manual worker IPs are given but fewer than min_devices."""
     if worker_ip_addresses:
-        required_count = max_nodes + 1
-        if len(worker_ip_addresses) < required_count:
+        if len(worker_ip_addresses) < min_devices:
             raise ValueError(
-                f"At least {required_count} worker IP addresses are required "
-                f"(max_nodes={max_nodes} active + 1 spare), "
+                f"At least {min_devices} worker IP addresses are required "
+                f"(min_devices={min_devices}), "
                 f"but only {len(worker_ip_addresses)} were given"
             )
 
@@ -277,6 +290,151 @@ def distribute_part_files_to_active_nodes(
 
 
 
+def handle_no_spare_nodes_recovery(
+    failed_ip: str,
+    node_index: int,
+    part_filename: str,
+    spare_nodes: list[str],
+    worker_pool: WorkerConnectionPool,
+    active_tasks: dict[str, dict],
+    parts_directory: str,
+    master_ip_address: str | None = None,
+    dashboard: StatusDashboard | None = None,
+) -> tuple[str, socket.socket, FileTransferDaemon]:
+    """When no spare nodes are available, ask user to (k)ill task or (w)ait 1 minute for new nodes to connect."""
+    printlog(f"\n[RECOVERY ALERT] Node {failed_ip} failed and no spare nodes are available for recovery.")
+
+    while True:
+        if dashboard:
+            dashboard.add_message(
+                f"ALERT: Node {failed_ip} failed! No spare nodes. Press 'k' to kill, 'w' to wait 1m.",
+                timeout_seconds=60,
+            )
+
+        print(f"\n==================================================================")
+        print(f"  NO RECOVERY NODES AVAILABLE FOR NODE{node_index} ({failed_ip})  ")
+        print(f"==================================================================")
+        print("One of the active devices has failed and no spare nodes are connected.")
+        print("Options:")
+        print("  [k] Kill task: Safely terminate running tasks on healthy nodes and exit.")
+        print("  [w] Wait 1 minute: Keep healthy nodes running and wait for a new node to connect.")
+        sys.stdout.write("Enter choice (k/w): ")
+        sys.stdout.flush()
+
+        choice = ""
+        fd = None
+        old_settings = None
+        if sys.stdin.isatty():
+            try:
+                import termios
+                import tty
+                fd = sys.stdin.fileno()
+                old_settings = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+            except Exception:
+                fd = None
+                old_settings = None
+
+        try:
+            while True:
+                if fd is not None:
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
+                    if rlist:
+                        char = sys.stdin.read(1).lower()
+                        if char in ("k", "w"):
+                            choice = char
+                            print(char)
+                            break
+                else:
+                    try:
+                        line = sys.stdin.readline().strip().lower()
+                        if line:
+                            if line.startswith("k"):
+                                choice = "k"
+                            elif line.startswith("w"):
+                                choice = "w"
+                            break
+                    except Exception:
+                        choice = "k"
+                        break
+                time.sleep(0.1)
+        finally:
+            if fd is not None and old_settings is not None:
+                try:
+                    import termios
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except Exception:
+                    pass
+
+        if choice == "k":
+            print("\nUser selected to KILL the task. Shutting down all healthy worker nodes...")
+            printlog(f"\nUser selected 'k' (kill task) after failure of node {failed_ip}.")
+            raise RuntimeError("Task execution killed by user due to node failure and lack of recovery nodes.")
+
+        elif choice == "w":
+            print("\nUser selected to WAIT. Waiting up to 60 seconds for a new node to connect...")
+            printlog(f"\nUser selected 'w' (wait 60s) after failure of node {failed_ip}.")
+            wait_start = time.time()
+            wait_timeout = 60.0
+            found_spare_ip = None
+
+            while time.time() - wait_start < wait_timeout:
+                elapsed_wait = int(time.time() - wait_start)
+                remaining = int(wait_timeout - elapsed_wait)
+
+                with worker_pool.lock:
+                    for ip in list(worker_pool.connections.keys()):
+                        if ip not in active_tasks and ip != failed_ip:
+                            found_spare_ip = ip
+                            break
+
+                if found_spare_ip:
+                    print(f"\n[NEW NODE CONNECTED] Discovered new node {found_spare_ip}!")
+                    printlog(f"[FAILOVER] New node {found_spare_ip} connected during wait period.")
+                    break
+
+                if dashboard:
+                    dashboard.add_message(
+                        f"Waiting for new nodes... ({remaining}s remaining). Press 'k' to cancel & kill.",
+                        timeout_seconds=2,
+                    )
+
+                if sys.stdin.isatty():
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+                    if rlist:
+                        char = sys.stdin.read(1).lower()
+                        if char == "k":
+                            print("\nUser pressed 'k' during wait. Shutting down task...")
+                            raise RuntimeError("Task execution killed by user during node wait period.")
+
+                for active_ip, task in list(active_tasks.items()):
+                    if task["exec_finished"] and not task["file_received"]:
+                        expected_output_file = Path(MASTER_OUTPUT_DIRECTORY) / task["part_filename"]
+                        if expected_output_file.is_file():
+                            task["file_received"] = True
+                            printlog(f"{PROGRESS_FINISHED} ({active_ip}, {task['part_filename']}) - result saved to {expected_output_file}")
+
+                time.sleep(0.5)
+
+            if found_spare_ip:
+                updated_mapping = swap_device_ip(failed_ip, found_spare_ip)
+                printlog(f"[FAILOVER] Updated devices.json: {updated_mapping}")
+
+                spare_connection = worker_pool.get_connection(found_spare_ip)
+                printlog(f"[FAILOVER] Reusing existing split file {part_filename} for spare node {found_spare_ip}")
+                daemon = distribute_part_file_to_single_node(
+                    found_spare_ip,
+                    part_filename,
+                    spare_connection,
+                    parts_directory,
+                    master_ip_address,
+                )
+                return found_spare_ip, spare_connection, daemon
+            else:
+                print("\n[TIMEOUT] 60 seconds elapsed and no new nodes connected.")
+                printlog("[RECOVERY TIMEOUT] 60s elapsed without new nodes.")
+
+
 def reassign_task_to_spare_node(
     failed_ip: str,
     node_index: int,
@@ -284,31 +442,49 @@ def reassign_task_to_spare_node(
     worker_pool: WorkerConnectionPool,
     parts_directory: str,
     master_ip_address: str | None = None,
+    active_tasks: dict[str, dict] | None = None,
+    dashboard: StatusDashboard | None = None,
 ) -> tuple[str, socket.socket, FileTransferDaemon]:
-    """Swap IP in devices.json and reassign task to the next spare node using existing split file."""
-    if not spare_nodes:
-        raise RuntimeError(
-            f"Node {failed_ip} failed and no spare nodes are available for reassignment!"
+    """Swap IP in devices.json and reassign task to the next spare node or prompt user if no spare is available."""
+    spare_ip = None
+    if spare_nodes:
+        spare_ip = spare_nodes.pop(0)
+    elif active_tasks is not None:
+        with worker_pool.lock:
+            for ip in list(worker_pool.connections.keys()):
+                if ip not in active_tasks and ip != failed_ip:
+                    spare_ip = ip
+                    break
+
+    if spare_ip:
+        printlog(f"\n Node {failed_ip} failed. Reassigning task to node{node_index}, {spare_ip}")
+        updated_mapping = swap_device_ip(failed_ip, spare_ip)
+        printlog(f"[FAILOVER] Updated devices.json: {updated_mapping}")
+
+        spare_connection = worker_pool.get_connection(spare_ip)
+        part_filename = part_filename_for_node(node_index)
+
+        printlog(f"[FAILOVER] Reusing existing split file {part_filename} for spare node {spare_ip}")
+        daemon = distribute_part_file_to_single_node(
+            spare_ip,
+            part_filename,
+            spare_connection,
+            parts_directory,
+            master_ip_address,
         )
-
-    spare_ip = spare_nodes.pop(0)
-    printlog(f"\n Node {failed_ip} failed 2 times. Reassigning task to node{node_index}, {spare_ip}")
-
-    updated_mapping = swap_device_ip(failed_ip, spare_ip)
-    printlog(f"[FAILOVER] Updated devices.json: {updated_mapping}")
-
-    spare_connection = worker_pool.get_connection(spare_ip)
-    part_filename = part_filename_for_node(node_index)
-
-    printlog(f"[FAILOVER] Reusing existing split file {part_filename} for spare node {spare_ip}")
-    daemon = distribute_part_file_to_single_node(
-        spare_ip,
-        part_filename,
-        spare_connection,
-        parts_directory,
-        master_ip_address,
-    )
-    return spare_ip, spare_connection, daemon
+        return spare_ip, spare_connection, daemon
+    else:
+        return handle_no_spare_nodes_recovery(
+            failed_ip,
+            node_index,
+            part_filename_for_node(node_index),
+            spare_nodes,
+            worker_pool,
+            active_tasks if active_tasks is not None else {},
+            parts_directory,
+            master_ip_address,
+            dashboard,
+        )
 
 
 def monitor_worker_executions_and_collect_results(
@@ -454,6 +630,8 @@ def monitor_worker_executions_and_collect_results(
                         worker_pool,
                         parts_directory,
                         master_ip_address,
+                        active_tasks=active_tasks,
+                        dashboard=dashboard,
                     )
                     active_daemons.append(daemon)
                     active_tasks[spare_ip] = {
@@ -499,7 +677,7 @@ def run_master() -> None:
 
     try:
         validate_worker_address_count(
-            arguments.worker_ip_addresses, config.max_nodes
+            arguments.worker_ip_addresses, config.min_devices
         )
     except ValueError as exc:
         print(f"Startup error: {exc}", file=sys.stderr)
@@ -629,13 +807,18 @@ def run_master() -> None:
         run_split_command(
             config.split_command,
             len(active_nodes),
+            input_video=arguments.input_video,
             parts_directory=arguments.parts_directory,
         )
-        verify_part_files(len(active_nodes), arguments.parts_directory)
+        verify_part_files(
+            len(active_nodes),
+            parts_directory=arguments.parts_directory,
+            split_command=config.split_command,
+        )
 
         for idx, ip in enumerate(active_nodes, start=1):
             dashboard.update_node(
-                ip, f"node{idx}", part_filename_for_node(idx), "sending file",
+                ip, f"node{idx}", part_filename_for_node(idx, split_command=config.split_command, parts_directory=arguments.parts_directory), "sending file",
                 receiving=False, executing=False, sending=True
             )
 
@@ -670,6 +853,7 @@ def run_master() -> None:
             config.merge_command,
             len(active_nodes),
             output_directory=MASTER_OUTPUT_DIRECTORY,
+            split_command=config.split_command,
         )
         dashboard.set_master_state("finished")
         printlog("\nAll tasks and merging completed successfully.")

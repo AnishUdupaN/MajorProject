@@ -1,6 +1,14 @@
+# Build / temporary files
 __pycache__
 new
 .old
 filelist.txt
 master
 worker
+idea.txt
+
+# Sensitive configuration and log files
+config.ini
+devices.json
+.env
+logs.txt

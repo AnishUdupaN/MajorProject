@@ -22,7 +22,7 @@ import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 from urllib.parse import unquote
 
 # ==============================================================================
@@ -59,6 +59,58 @@ MESSAGE_TYPE_FILE_RECEIVED = "file_received"
 MESSAGE_TYPE_FINISHED = "finished"
 MESSAGE_TYPE_FAILED = "failed"
 MESSAGE_TYPE_SHUTDOWN = "shutdown"
+MESSAGE_TYPE_AUTH = "auth"
+
+# Message schema validation: required keys for each message type.
+MESSAGE_REQUIRED_KEYS = {
+    MESSAGE_TYPE_READY: ['type', 'master_ip_address', 'file_transfer_port'],
+    MESSAGE_TYPE_FILE_RECEIVED: ['type'],
+    MESSAGE_TYPE_FINISHED: ['type', 'execution_time', 'part_filename'],
+    MESSAGE_TYPE_FAILED: ['type', 'reason'],
+    MESSAGE_TYPE_SHUTDOWN: ['type'],
+    MESSAGE_TYPE_AUTH: ['type', 'secret'],
+}
+
+
+def validate_message(msg: dict) -> None:
+    """Validate that a received message has the correct structure and required keys."""
+    if not isinstance(msg, dict):
+        raise ValueError(f"Expected dict message, got {type(msg).__name__}")
+    msg_type = msg.get('type')
+    if msg_type is None:
+        raise ValueError("Message missing required 'type' field")
+    required = MESSAGE_REQUIRED_KEYS.get(msg_type)
+    if required is None:
+        raise ValueError(f"Unknown message type: {msg_type!r}")
+    missing = [key for key in required if key not in msg]
+    if missing:
+        raise ValueError(f"Message type '{msg_type}' missing required keys: {', '.join(missing)}")
+
+
+# Shared-secret authentication via environment variable.
+SHARED_SECRET_ENV_VAR = "DIST_SHARED_SECRET"
+
+
+def get_shared_secret() -> str | None:
+    """Read the optional shared secret from environment variable."""
+    secret = os.environ.get(SHARED_SECRET_ENV_VAR, "").strip()
+    return secret if secret else None
+
+
+def send_auth_message(connection: socket.socket, secret: str) -> None:
+    """Send an authentication message with the shared secret."""
+    send_json_message(connection, {"type": MESSAGE_TYPE_AUTH, "secret": secret})
+
+
+def verify_auth_message(connection: socket.socket, expected_secret: str) -> bool:
+    """Receive and verify an authentication message. Returns True if valid."""
+    try:
+        msg = receive_json_message(connection)
+        if msg.get("type") != MESSAGE_TYPE_AUTH:
+            return False
+        return msg.get("secret") == expected_secret
+    except (ValueError, ConnectionError, json.JSONDecodeError):
+        return False
 
 PART_FILENAME_PREFIX = "part"
 PART_FILENAME_SUFFIX = ".mkv"
@@ -85,6 +137,7 @@ class Config:
     execute_command: str
     merge_command: str
     max_nodes: int
+    min_devices: int = 2
     on_high_usage: str = "kill"
     long_runnable: bool = False
     cpu_threshold_percent: float = 20.0
@@ -96,10 +149,13 @@ class Config:
     max_throttle_duration_seconds: float = 600.0
     unthrottle_threshold_seconds: float = 20.0
 
+_LOG_LOCK = threading.Lock()
+
 def printlog(st):
-    f=open("logs.txt","a+")
-    f.write(st+"\n")
-    f.close()
+    with _LOG_LOCK:
+        with open("logs.txt", "a+") as f:
+            f.write(st + "\n")
+
 
 def load_config(config_path: str) -> Config:
     path = Path(config_path)
@@ -126,6 +182,8 @@ def load_config(config_path: str) -> Config:
     if max_nodes < 1:
         raise ValueError(f"max_nodes must be a positive integer, got {max_nodes}")
 
+    min_devices = section.getint("min_devices", fallback=max_nodes)
+
     on_high_usage = section.get("on_high_usage", "kill").strip().lower()
     if on_high_usage not in ("kill", "throttle"):
         on_high_usage = "kill"
@@ -135,6 +193,7 @@ def load_config(config_path: str) -> Config:
         execute_command=section[CONFIG_KEY_EXECUTE_COMMAND].strip(),
         merge_command=section[CONFIG_KEY_MERGE_COMMAND].strip(),
         max_nodes=max_nodes,
+        min_devices=min_devices,
         on_high_usage=on_high_usage,
         long_runnable=section.getboolean("long_runnable", fallback=False),
         cpu_threshold_percent=section.getfloat("cpu_threshold_percent", fallback=20.0),
@@ -494,7 +553,9 @@ def receive_json_message(connection: socket.socket) -> dict:
 
     line, remainder = buf.split("\n", 1)
     _SOCKET_BUFFERS[connection] = remainder
-    return json.loads(line)
+    message = json.loads(line)
+    validate_message(message)
+    return message
 
 
 def has_buffered_message(connection: socket.socket) -> bool:
@@ -765,6 +826,11 @@ def _make_handler_class(
                 .removeprefix("/upload/")
                 .lstrip("/")
             )
+            # VULN-04: Sanitize filename to prevent path traversal
+            filename = os.path.basename(filename)
+            if not filename or filename.startswith('.'):
+                self.send_error(400, "Bad Request - invalid filename")
+                return
             content_length = int(self.headers.get("Content-Length", 0))
             if content_length <= 0:
                 self.send_error(400, "Bad Request - missing Content-Length")
@@ -1299,11 +1365,36 @@ def run_execute_command(
                 )
                 return elapsed_seconds
 
-            if connection is not None and check_socket_connection_lost(connection):
-                sys.stdout.write("\n")
-                print("\nConnection to server lost! Force-stopping running process...")
-                force_stop_process(process)
-                raise ConnectionError("Server connection lost during task execution")
+            if connection is not None:
+                if has_buffered_message(connection):
+                    msg = receive_json_message(connection)
+                    if msg.get("type") == MESSAGE_TYPE_SHUTDOWN:
+                        sys.stdout.write("\n")
+                        print("\nMaster sent shutdown signal! Force-stopping running process...")
+                        force_stop_process(process)
+                        raise MasterShutdownError("Master sent shutdown signal during task execution")
+                else:
+                    try:
+                        rlist, _, _ = select.select([connection], [], [], 0.0)
+                        if rlist:
+                            peek = connection.recv(1024, socket.MSG_PEEK)
+                            if not peek:
+                                sys.stdout.write("\n")
+                                print("\nConnection to server lost! Force-stopping running process...")
+                                force_stop_process(process)
+                                raise ConnectionError("Server connection lost during task execution")
+                            else:
+                                msg = receive_json_message(connection)
+                                if msg.get("type") == MESSAGE_TYPE_SHUTDOWN:
+                                    sys.stdout.write("\n")
+                                    print("\nMaster sent shutdown signal! Force-stopping running process...")
+                                    force_stop_process(process)
+                                    raise MasterShutdownError("Master sent shutdown signal during task execution")
+                    except (OSError, ConnectionError):
+                        sys.stdout.write("\n")
+                        print("\nConnection to server lost! Force-stopping running process...")
+                        force_stop_process(process)
+                        raise ConnectionError("Server connection lost during task execution")
 
             if (
                 simulate_failure_after is not None
@@ -1345,9 +1436,70 @@ def run_execute_command(
 # SECTION 9: MASTER SPLIT VIDEO LOGIC
 # ==============================================================================
 
-def part_filename_for_node(node_index: int) -> str:
-    """Return the split output name for a node (part1.mkv, part2.mkv, ...)."""
-    return f"{PART_FILENAME_PREFIX}{node_index}{PART_FILENAME_SUFFIX}"
+def resolve_input_video(
+    split_command: str = "",
+    input_video: Optional[str] = None,
+    parts_directory: str = MASTER_INPUT_DIRECTORY,
+) -> str:
+    """Resolve the actual input video path.
+    If input_video exists on disk, returns it.
+    Otherwise, attempts to infer it from split_command or by searching parts_directory.
+    """
+    if input_video and input_video != DEFAULT_INPUT_VIDEO and Path(input_video).is_file():
+        return input_video
+
+    if Path(DEFAULT_INPUT_VIDEO).is_file():
+        return DEFAULT_INPUT_VIDEO
+
+    # Extract input file path from split_command (-i <path>)
+    if split_command:
+        match = re.search(r'-i\s+([^\s]+)', split_command)
+        if match:
+            candidate = match.group(1).replace("{input_directory}", parts_directory)
+            if Path(candidate).is_file():
+                return candidate
+
+    parts_path = Path(parts_directory)
+    if parts_path.is_dir():
+        for candidate in sorted(parts_path.glob("input.*")):
+            if candidate.is_file():
+                return str(candidate)
+        for candidate in sorted(parts_path.iterdir()):
+            if candidate.is_file() and not candidate.name.startswith("part") and candidate.name != "filelist.txt":
+                return str(candidate)
+
+    return input_video or DEFAULT_INPUT_VIDEO
+
+
+def get_part_extension(
+    split_command: str = "",
+    parts_directory: str = MASTER_INPUT_DIRECTORY,
+) -> str:
+    """Infer part file extension (.webm, .mkv, .mp4) from split_command or existing part files."""
+    if split_command:
+        match = re.search(r'part(?:%d|\d+)?(\.[a-zA-Z0-9]+)', split_command)
+        if match:
+            return match.group(1)
+
+    parts_path = Path(parts_directory)
+    if parts_path.is_dir():
+        for item in parts_path.iterdir():
+            if item.is_file() and item.name.startswith("part"):
+                return item.suffix
+
+    return PART_FILENAME_SUFFIX
+
+
+def part_filename_for_node(
+    node_index: int,
+    extension: Optional[str] = None,
+    split_command: str = "",
+    parts_directory: str = MASTER_INPUT_DIRECTORY,
+) -> str:
+    """Return the split output name for a node (part1.mkv, part2.webm, ...)."""
+    if extension is None:
+        extension = get_part_extension(split_command, parts_directory)
+    return f"{PART_FILENAME_PREFIX}{node_index}{extension}"
 
 
 def get_video_duration_seconds(input_video: str) -> float:
@@ -1377,12 +1529,13 @@ def get_video_duration_seconds(input_video: str) -> float:
 def build_split_command(
     split_command: str,
     active_node_count: int,
-    input_video: str = DEFAULT_INPUT_VIDEO,
+    input_video: Optional[str] = None,
     parts_directory: str = MASTER_INPUT_DIRECTORY,
 ) -> str:
     """Fill split_command placeholders so ffmpeg produces exactly one part per active node."""
+    actual_input = resolve_input_video(split_command, input_video, parts_directory)
     if "{segment_times}" in split_command:
-        duration_seconds = get_video_duration_seconds(input_video)
+        duration_seconds = get_video_duration_seconds(actual_input)
         split_points = [
             duration_seconds * node_index / active_node_count
             for node_index in range(1, active_node_count)
@@ -1399,21 +1552,23 @@ def build_split_command(
 def run_split_command(
     split_command: str,
     active_node_count: int,
-    input_video: str = DEFAULT_INPUT_VIDEO,
+    input_video: Optional[str] = None,
     parts_directory: str = MASTER_INPUT_DIRECTORY,
 ) -> None:
     """On start, master runs split_command from config against the input video,
     writing exactly active_node_count part files into parts_directory (master/input/)."""
     print(PROGRESS_SPLITTING_FILE)
     Path(parts_directory).mkdir(parents=True, exist_ok=True)
+    actual_input = resolve_input_video(split_command, input_video, parts_directory)
 
     if active_node_count == 1:
-        destination = Path(parts_directory) / part_filename_for_node(1)
-        shutil.copyfile(input_video, destination)
+        ext = get_part_extension(split_command, parts_directory)
+        destination = Path(parts_directory) / part_filename_for_node(1, extension=ext)
+        shutil.copyfile(actual_input, destination)
         return
 
     resolved_command = build_split_command(
-        split_command, active_node_count, input_video, parts_directory
+        split_command, active_node_count, actual_input, parts_directory
     )
     command_parts = shlex.split(resolved_command)
     result = subprocess.run(
@@ -1431,12 +1586,15 @@ def run_split_command(
 
 
 def verify_part_files(
-    active_node_count: int, parts_directory: str = MASTER_INPUT_DIRECTORY
+    active_node_count: int,
+    parts_directory: str = MASTER_INPUT_DIRECTORY,
+    split_command: str = "",
 ) -> list[str]:
-    """Verify part1.mkv through partN.mkv exist for each active node."""
+    """Verify part1 through partN exist for each active node."""
     parts_path = Path(parts_directory)
+    ext = get_part_extension(split_command, parts_directory)
     part_filenames = [
-        part_filename_for_node(node_index)
+        part_filename_for_node(node_index, extension=ext)
         for node_index in range(1, active_node_count + 1)
     ]
     missing_parts = [
@@ -1457,24 +1615,28 @@ def verify_part_files(
 # ==============================================================================
 
 def generate_filelist_text(
-    active_node_count: int, output_directory: str = MASTER_OUTPUT_DIRECTORY
+    active_node_count: int,
+    output_directory: str = MASTER_OUTPUT_DIRECTORY,
+    split_command: str = "",
 ) -> str:
     """Generate the contents of filelist.txt for ffmpeg concat demuxer using absolute paths."""
     dir_path = Path(output_directory).resolve()
     lines = [
-        f"file '{dir_path / f'{PART_FILENAME_PREFIX}{index}{PART_FILENAME_SUFFIX}'}'"
+        f"file '{dir_path / part_filename_for_node(index, split_command=split_command, parts_directory=output_directory)}'"
         for index in range(1, active_node_count + 1)
     ]
     return "\n".join(lines) + "\n"
 
 
 def write_filelist_txt(
-    active_node_count: int, output_directory: str = MASTER_OUTPUT_DIRECTORY
+    active_node_count: int,
+    output_directory: str = MASTER_OUTPUT_DIRECTORY,
+    split_command: str = "",
 ) -> str:
     """Write filelist.txt into output_directory AND root working directory for universal compatibility."""
     dir_path = Path(output_directory)
     dir_path.mkdir(parents=True, exist_ok=True)
-    content = generate_filelist_text(active_node_count, output_directory)
+    content = generate_filelist_text(active_node_count, output_directory, split_command=split_command)
 
     filelist_in_output = dir_path / "filelist.txt"
     filelist_in_output.write_text(content)
@@ -1499,10 +1661,11 @@ def run_merge_command(
     merge_command_template: str,
     active_node_count: int,
     output_directory: str = MASTER_OUTPUT_DIRECTORY,
+    split_command: str = "",
 ) -> str:
     """Once all worker nodes finish, combine output parts into one final file."""
     print(PROGRESS_MERGING_FILES)
-    write_filelist_txt(active_node_count, output_directory)
+    write_filelist_txt(active_node_count, output_directory, split_command=split_command)
     resolved_command = build_merge_command(merge_command_template, output_directory)
     command_parts = shlex.split(resolved_command)
 
@@ -1537,6 +1700,7 @@ class StatusDashboard:
     """Live CLI status view tracking master and per-node states as specified in idea.txt."""
 
     def __init__(self, master_state: str = "initializing") -> None:
+        self.lock = threading.Lock()
         self.master_state = master_state
         self.splitting_flag = False
         self.merging_flag = False
@@ -1546,17 +1710,19 @@ class StatusDashboard:
 
     def add_message(self, text: str, timeout_seconds: int = 10) -> None:
         """Add an event/alert message with a countdown period to the dashboard (idea.txt)."""
-        self.messages.append({"text": text, "time_left": float(timeout_seconds)})
-        self.render()
+        with self.lock:
+            self.messages.append({"text": text, "time_left": float(timeout_seconds)})
+            self._render_unlocked()
 
     def set_master_state(self, state: str) -> None:
         """Update overall master state (e.g. splitting file, merging files, finished)."""
-        self.master_state = state
-        if state == PROGRESS_SPLITTING_FILE:
-            self.splitting_flag = True
-        elif state == PROGRESS_MERGING_FILES:
-            self.merging_flag = True
-        self.render()
+        with self.lock:
+            self.master_state = state
+            if state == PROGRESS_SPLITTING_FILE:
+                self.splitting_flag = True
+            elif state == PROGRESS_MERGING_FILES:
+                self.merging_flag = True
+            self._render_unlocked()
 
     def update_node_flags(
         self,
@@ -1566,11 +1732,12 @@ class StatusDashboard:
         sending: bool = False,
     ) -> None:
         """Update 3-phase node state flags (idea.txt)."""
-        if node_ip in self.node_states:
-            self.node_states[node_ip]["receiving"] = receiving
-            self.node_states[node_ip]["executing"] = executing
-            self.node_states[node_ip]["sending"] = sending
-            self.render()
+        with self.lock:
+            if node_ip in self.node_states:
+                self.node_states[node_ip]["receiving"] = receiving
+                self.node_states[node_ip]["executing"] = executing
+                self.node_states[node_ip]["sending"] = sending
+                self._render_unlocked()
 
     def update_node(
         self,
@@ -1586,30 +1753,36 @@ class StatusDashboard:
         sending: bool | None = None,
     ) -> None:
         """Update individual worker node state and flags."""
-        existing = self.node_states.get(node_ip, {})
-        rcv = receiving if receiving is not None else existing.get("receiving", False)
-        exc = executing if executing is not None else existing.get("executing", False)
-        snd = sending if sending is not None else existing.get("sending", False)
+        with self.lock:
+            existing = self.node_states.get(node_ip, {})
+            rcv = receiving if receiving is not None else existing.get("receiving", False)
+            exc = executing if executing is not None else existing.get("executing", False)
+            snd = sending if sending is not None else existing.get("sending", False)
 
-        self.node_states[node_ip] = {
-            "node_id": node_id,
-            "filename": filename,
-            "state": state,
-            "elapsed": elapsed_seconds,
-            "pct": pct,
-            "eta": eta,
-            "receiving": rcv,
-            "executing": exc,
-            "sending": snd,
-        }
-        self.render()
+            self.node_states[node_ip] = {
+                "node_id": node_id,
+                "filename": filename,
+                "state": state,
+                "elapsed": elapsed_seconds,
+                "pct": pct,
+                "eta": eta,
+                "receiving": rcv,
+                "executing": exc,
+                "sending": snd,
+            }
+            self._render_unlocked()
 
     def remove_node(self, node_ip: str) -> None:
         """Remove a node from the active dashboard view."""
-        self.node_states.pop(node_ip, None)
-        self.render()
+        with self.lock:
+            self.node_states.pop(node_ip, None)
+            self._render_unlocked()
 
     def render(self) -> None:
+        with self.lock:
+            self._render_unlocked()
+
+    def _render_unlocked(self) -> None:
         now = time.time()
         dt = now - self._last_render_time
         self._last_render_time = now
