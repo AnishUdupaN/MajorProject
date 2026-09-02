@@ -13,11 +13,15 @@ from core import (
     FIXED_PORT,
     MASTER_INPUT_DIRECTORY,
     MASTER_OUTPUT_DIRECTORY,
+    MDNS_MASTER_FQDN,
+    MDNS_SERVICE_MASTER,
     PROGRESS_EXECUTING,
     PROGRESS_FINISHED,
     PROGRESS_RECEIVING_FILES,
     PROGRESS_SENDING_FILE,
+    Config,
     FileTransferDaemon,
+    MdnsAnnouncer,
     StatusDashboard,
     get_local_ip_for_peer,
     has_buffered_message,
@@ -48,11 +52,11 @@ class WorkerConnectionPool:
 
     def __init__(
         self,
-        allowed_ips: list[str],
+        allowed_ips: list[str] | None,
         listening_socket: socket.socket,
         dashboard: StatusDashboard | None = None,
     ) -> None:
-        self.allowed_ips = set(allowed_ips)
+        self.allowed_ips = set(allowed_ips) if allowed_ips else None
         self.listening_socket = listening_socket
         self.dashboard = dashboard
         self.connections: dict[str, socket.socket] = {}
@@ -69,7 +73,7 @@ class WorkerConnectionPool:
                     continue
                 conn, addr = self.listening_socket.accept()
                 ip = addr[0]
-                if ip not in self.allowed_ips:
+                if self.allowed_ips and ip not in self.allowed_ips:
                     conn.close()
                     continue
                 with self.lock:
@@ -91,8 +95,6 @@ class WorkerConnectionPool:
                             self.dashboard.update_node(ip, "worker", "-", "idle")
             except Exception:
                 pass
-
-
 
     def get_connection(self, ip: str, timeout_seconds: float = 30.0) -> socket.socket:
         """Fetch connection for ip from pool, waiting if not yet connected."""
@@ -130,7 +132,7 @@ class WorkerConnectionPool:
 
 
 def parse_master_arguments() -> argparse.Namespace:
-    """Parse CLI arguments for master startup with a list of worker IP addresses."""
+    """Parse CLI arguments for master startup with optional list of worker IP addresses."""
     parser = argparse.ArgumentParser(
         description="Start the master node for distributed video processing."
     )
@@ -151,8 +153,9 @@ def parse_master_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "worker_ip_addresses",
-        nargs="+",
-        help="IP addresses of worker nodes (at least max_nodes + 1 required)",
+        nargs="*",
+        default=None,
+        help="Optional IP addresses of worker nodes. If omitted, auto-discovers workers via mDNS.",
     )
     return parser.parse_args()
 
@@ -167,16 +170,18 @@ def split_active_and_spare_addresses(
 
 
 def validate_worker_address_count(
-    worker_ip_addresses: list[str], max_nodes: int
+    worker_ip_addresses: list[str] | None, max_nodes: int
 ) -> None:
-    """Reject startup if fewer than max_nodes + 1 IP addresses are given."""
-    required_count = max_nodes + 1
-    if len(worker_ip_addresses) < required_count:
-        raise ValueError(
-            f"At least {required_count} worker IP addresses are required "
-            f"(max_nodes={max_nodes} active + 1 spare), "
-            f"but only {len(worker_ip_addresses)} were given"
-        )
+    """Reject startup if manual worker IPs are given but fewer than max_nodes + 1."""
+    if worker_ip_addresses:
+        required_count = max_nodes + 1
+        if len(worker_ip_addresses) < required_count:
+            raise ValueError(
+                f"At least {required_count} worker IP addresses are required "
+                f"(max_nodes={max_nodes} active + 1 spare), "
+                f"but only {len(worker_ip_addresses)} were given"
+            )
+
 
 
 def open_listening_socket(port: int) -> socket.socket:
@@ -216,6 +221,7 @@ def distribute_part_files_to_active_nodes(
     worker_pool: WorkerConnectionPool,
     parts_directory: str,
     master_ip_address: str | None = None,
+    dashboard: StatusDashboard | None = None,
 ) -> list[FileTransferDaemon]:
     """Start one file-transfer daemon per node and distribute part files in parallel."""
     daemons: list[FileTransferDaemon] = []
@@ -254,12 +260,21 @@ def distribute_part_files_to_active_nodes(
         file_transfer_port,
     ) in pending_transfers:
         printlog(f"{PROGRESS_SENDING_FILE} ({worker_ip_address}, {part_filename})")
+        if dashboard:
+            dashboard.add_message(
+                f"Sending {part_filename} to {worker_ip_address}", timeout_seconds=8
+            )
         send_ready_message(connection, reachable_master_ip, file_transfer_port)
 
     for worker_ip_address, part_filename, connection, _, _ in pending_transfers:
         receive_file_received_message(connection)
-        
+        if dashboard:
+            dashboard.update_node_flags(
+                worker_ip_address, receiving=False, executing=True, sending=False
+            )
+
     return daemons
+
 
 
 def reassign_task_to_spare_node(
@@ -337,13 +352,15 @@ def monitor_worker_executions_and_collect_results(
                 printlog(f"{PROGRESS_EXECUTING} ({ip}, {task['part_filename']}) - live running time: {minutes:02d}:{secs:02d}")
                 if dashboard:
                     dashboard.update_node(
-                        ip, node_id, task["part_filename"], PROGRESS_EXECUTING, elapsed
+                        ip, node_id, task["part_filename"], PROGRESS_EXECUTING, elapsed,
+                        receiving=False, executing=True, sending=False
                     )
             else:
                 printlog(f"{PROGRESS_RECEIVING_FILES} ({ip}, {task['part_filename']})")
                 if dashboard:
                     dashboard.update_node(
-                        ip, node_id, task["part_filename"], PROGRESS_RECEIVING_FILES
+                        ip, node_id, task["part_filename"], PROGRESS_RECEIVING_FILES,
+                        receiving=True, executing=False, sending=False
                     )
 
         # Check sockets for incoming finished/failed messages or disconnections
@@ -363,7 +380,6 @@ def monitor_worker_executions_and_collect_results(
             ip = socket_map[sock]
             task = active_tasks[ip]
 
-
             try:
                 msg = receive_json_message(sock)
                 if msg.get("type") == "finished":
@@ -375,7 +391,11 @@ def monitor_worker_executions_and_collect_results(
                     printlog(f"{PROGRESS_RECEIVING_FILES} ({ip}, {task['part_filename']})")
                     if dashboard:
                         dashboard.update_node(
-                            ip, f"node{task['node_index']}", task["part_filename"], PROGRESS_RECEIVING_FILES
+                            ip, f"node{task['node_index']}", task["part_filename"], PROGRESS_RECEIVING_FILES,
+                            receiving=True, executing=False, sending=False
+                        )
+                        dashboard.add_message(
+                            f"Node {ip} finished {task['part_filename']} in {exec_time:.2f}s", timeout_seconds=10
                         )
                 elif msg.get("type") == "failed":
                     raise ConnectionError(f"Node reported failure: {msg.get('reason')}")
@@ -388,9 +408,8 @@ def monitor_worker_executions_and_collect_results(
                     part_filename = task["part_filename"]
                     del active_tasks[ip]
                     if dashboard:
-                        dashboard.update_node(ip, f"node{node_index}", "-", "idle")
-
-
+                        dashboard.update_node(ip, f"node{node_index}", "-", "idle", receiving=False, executing=False, sending=False)
+                        dashboard.add_message(f"ALERT: Node {ip} task failed ({exc})", timeout_seconds=12)
 
                     retries = node_retries.get(ip, 0)
                     if retries < 1:
@@ -403,6 +422,7 @@ def monitor_worker_executions_and_collect_results(
                         retry_conn = None
                         try:
                             retry_conn = worker_pool.get_connection(ip, timeout_seconds=8.0)
+
                         except TimeoutError:
                             printlog(f"[RETRY FAILED] Node {ip} did not reconnect within timeout.")
 
@@ -485,22 +505,19 @@ def run_master() -> None:
         print(f"Startup error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    active_nodes, spare_nodes = split_active_and_spare_addresses(
-        arguments.worker_ip_addresses, config.max_nodes
-    )
-
-    device_mapping = write_devices_json(active_nodes)
-
     # master/input holds split parts; master/output holds merged results.
     Path(arguments.parts_directory).mkdir(parents=True, exist_ok=True)
     Path(MASTER_OUTPUT_DIRECTORY).mkdir(parents=True, exist_ok=True)
 
+    # Start Master mDNS announcer in background
+    mdns_announcer = MdnsAnnouncer(
+        fqdn=MDNS_MASTER_FQDN, service=MDNS_SERVICE_MASTER
+    )
+    mdns_announcer.start()
+
     dashboard = StatusDashboard(master_state="initializing")
 
     print(f"Loaded config from {arguments.config}")
-    print(f"Active nodes ({len(active_nodes)}): {', '.join(active_nodes)}")
-    print(f"Spare nodes ({len(spare_nodes)}): {', '.join(spare_nodes)}")
-    printlog(f"Wrote devices.json: {device_mapping}")
     print(f"Listening on control port {CONTROL_PORT}...")
 
     listening_socket = open_listening_socket(FIXED_PORT)
@@ -508,6 +525,98 @@ def run_master() -> None:
         arguments.worker_ip_addresses, listening_socket, dashboard=dashboard
     )
     daemons: list[FileTransferDaemon] = []
+
+    if arguments.worker_ip_addresses:
+        active_nodes, spare_nodes = split_active_and_spare_addresses(
+            arguments.worker_ip_addresses, config.max_nodes
+        )
+    else:
+        dashboard.set_master_state("discovering workers")
+        start_time = time.time()
+        timeout_seconds = 60.0
+        deadline = start_time + timeout_seconds
+
+        fd = None
+        old_settings = None
+        if sys.stdin.isatty():
+            try:
+                import termios
+                import tty
+
+                fd = sys.stdin.fileno()
+                old_settings = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+            except Exception:
+                fd = None
+                old_settings = None
+
+        try:
+            print("mDNS Worker Discovery active. Press 'y' to start task execution when ready...")
+            while True:
+                now = time.time()
+                remaining = int(max(0.0, deadline - now))
+                with worker_pool.lock:
+                    connected_ips = list(worker_pool.connections.keys())
+
+                dashboard.add_message(
+                    f"Discovered {len(connected_ips)} worker(s). Press 'y' to start processing, 'q' to quit ({remaining}s remaining)",
+                    timeout_seconds=2,
+                )
+
+                if fd is not None:
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
+                    if rlist:
+                        char = sys.stdin.read(1).lower()
+                        if char == "y":
+                            if not connected_ips:
+                                dashboard.add_message("Cannot start: 0 workers discovered yet! Waiting...", timeout_seconds=5)
+                            else:
+                                break
+                        elif char == "q":
+                            print("\nUser pressed 'q'. Exiting discovery...")
+                            sys.exit(0)
+                else:
+                    if connected_ips:
+                        print(f"\nAuto-discovered workers: {connected_ips}")
+                        break
+
+                if now >= deadline:
+                    if not connected_ips:
+                        print(
+                            f"\n[DISCOVERY TIMEOUT] No workers discovered within {int(timeout_seconds)}s. Exiting safely.",
+                            file=sys.stderr,
+                        )
+                        sys.exit(0)
+                    else:
+                        print(
+                            f"\n[DISCOVERY TIMEOUT] Timeout reached ({int(timeout_seconds)}s). Proceeding with {len(connected_ips)} discovered worker(s)."
+                        )
+                        break
+                time.sleep(0.5)
+        finally:
+            if fd is not None and old_settings is not None:
+                try:
+                    import termios
+
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except Exception:
+                    pass
+
+        with worker_pool.lock:
+            connected_ips = list(worker_pool.connections.keys())
+
+        if len(connected_ips) >= config.max_nodes:
+            active_nodes, spare_nodes = split_active_and_spare_addresses(
+                connected_ips, config.max_nodes
+            )
+        else:
+            active_nodes = connected_ips
+            spare_nodes = []
+
+    device_mapping = write_devices_json(active_nodes)
+    print(f"Active nodes ({len(active_nodes)}): {', '.join(active_nodes)}")
+    print(f"Spare nodes ({len(spare_nodes)}): {', '.join(spare_nodes)}")
+    printlog(f"Wrote devices.json: {device_mapping}")
 
 
     try:
@@ -525,13 +634,17 @@ def run_master() -> None:
         verify_part_files(len(active_nodes), arguments.parts_directory)
 
         for idx, ip in enumerate(active_nodes, start=1):
-            dashboard.update_node(ip, f"node{idx}", part_filename_for_node(idx), "sending file")
+            dashboard.update_node(
+                ip, f"node{idx}", part_filename_for_node(idx), "sending file",
+                receiving=False, executing=False, sending=True
+            )
 
         initial_daemons = distribute_part_files_to_active_nodes(
             active_nodes,
             worker_pool,
             arguments.parts_directory,
             master_ip_address=arguments.master_ip,
+            dashboard=dashboard,
         )
         daemons.extend(initial_daemons)
 

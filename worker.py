@@ -10,10 +10,15 @@ from pathlib import Path
 from core import (
     CONTROL_PORT,
     FIXED_PORT,
+    MDNS_SERVICE_WORKER,
+    MDNS_WORKER_FQDN,
     PROGRESS_FINISHED,
     WORKER_INPUT_DIRECTORY,
     WORKER_OUTPUT_DIRECTORY,
+    Config,
     MasterShutdownError,
+    MdnsAnnouncer,
+    discover_master_ip,
     load_config,
     receive_ready_message,
     request_file,
@@ -26,9 +31,8 @@ from core import (
 )
 
 
-
 def parse_worker_arguments() -> argparse.Namespace:
-    """Parse CLI arguments for worker startup with master IP address and optional flags."""
+    """Parse CLI arguments for worker startup with optional master IP address and flags."""
     parser = argparse.ArgumentParser(
         description="Start a worker node for distributed video processing."
     )
@@ -61,9 +65,12 @@ def parse_worker_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "master_ip_address",
-        help="IP address of the master node",
+        nargs="?",
+        default=None,
+        help="Optional IP address of master node. If omitted, auto-discovers Master via mDNS.",
     )
     return parser.parse_args()
+
 
 
 def connect_to_master(
@@ -106,6 +113,7 @@ def run_worker_task(
     download_directory: str,
     execute_command_template: str,
     simulate_failure_after: float | None = None,
+    config: Config | None = None,
 ) -> None:
     """Handle ready message, fetch allocated part file, run execute_command, send finished signal, and upload result."""
     ready_message = receive_ready_message(connection)
@@ -129,6 +137,7 @@ def run_worker_task(
             output_directory=WORKER_OUTPUT_DIRECTORY,
             connection=connection,
             simulate_failure_after=simulate_failure_after,
+            config=config,
         )
     except (KeyboardInterrupt, RuntimeError, ValueError) as exc:
         try:
@@ -152,6 +161,7 @@ def run_worker_task(
 
 
 
+
 def run_worker() -> None:
     """Connect to master and persist in an idle loop, executing tasks as assigned."""
     arguments = parse_worker_arguments()
@@ -167,6 +177,21 @@ def run_worker() -> None:
     Path(arguments.download_directory).mkdir(parents=True, exist_ok=True)
     Path(WORKER_OUTPUT_DIRECTORY).mkdir(parents=True, exist_ok=True)
 
+    # Start worker mDNS announcer in background
+    mdns_announcer = MdnsAnnouncer(
+        fqdn=MDNS_WORKER_FQDN, service=MDNS_SERVICE_WORKER
+    )
+    mdns_announcer.start()
+
+    if not master_ip_address:
+        print("No master IP address specified. Auto-discovering Master via mDNS...")
+        try:
+            master_ip_address = discover_master_ip(timeout_seconds=60.0)
+        except TimeoutError as exc:
+            print(f"Discovery error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"Connecting to Master at {master_ip_address}:{FIXED_PORT}...")
     print("Press 'k' to kill the task.")
 
     connection = None
@@ -207,6 +232,7 @@ def run_worker() -> None:
                 arguments.download_directory,
                 config.execute_command,
                 simulate_failure_after=current_sim_fail,
+                config=config,
             )
             print("Task completed. Node returning to IDLE state. Waiting for next task...")
 

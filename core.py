@@ -12,6 +12,7 @@ import select
 import shlex
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -84,6 +85,16 @@ class Config:
     execute_command: str
     merge_command: str
     max_nodes: int
+    on_high_usage: str = "kill"
+    long_runnable: bool = False
+    cpu_threshold_percent: float = 20.0
+    cpu_threshold_seconds: float = 20.0
+    nice_initial: int = 5
+    nice_step: int = 5
+    nice_max: int = 19
+    nice_check_interval_seconds: float = 60.0
+    max_throttle_duration_seconds: float = 600.0
+    unthrottle_threshold_seconds: float = 20.0
 
 def printlog(st):
     f=open("logs.txt","a+")
@@ -115,11 +126,25 @@ def load_config(config_path: str) -> Config:
     if max_nodes < 1:
         raise ValueError(f"max_nodes must be a positive integer, got {max_nodes}")
 
+    on_high_usage = section.get("on_high_usage", "kill").strip().lower()
+    if on_high_usage not in ("kill", "throttle"):
+        on_high_usage = "kill"
+
     return Config(
         split_command=section[CONFIG_KEY_SPLIT_COMMAND].strip(),
         execute_command=section[CONFIG_KEY_EXECUTE_COMMAND].strip(),
         merge_command=section[CONFIG_KEY_MERGE_COMMAND].strip(),
         max_nodes=max_nodes,
+        on_high_usage=on_high_usage,
+        long_runnable=section.getboolean("long_runnable", fallback=False),
+        cpu_threshold_percent=section.getfloat("cpu_threshold_percent", fallback=20.0),
+        cpu_threshold_seconds=section.getfloat("cpu_threshold_seconds", fallback=20.0),
+        nice_initial=section.getint("nice_initial", fallback=5),
+        nice_step=section.getint("nice_step", fallback=5),
+        nice_max=section.getint("nice_max", fallback=19),
+        nice_check_interval_seconds=section.getfloat("nice_check_interval_seconds", fallback=60.0),
+        max_throttle_duration_seconds=section.getfloat("max_throttle_duration_seconds", fallback=600.0),
+        unthrottle_threshold_seconds=section.getfloat("unthrottle_threshold_seconds", fallback=20.0),
     )
 
 
@@ -172,8 +197,260 @@ def swap_device_ip(
 
 
 # ==============================================================================
-# SECTION 4: NETWORK HELPERS
+# SECTION 4: NETWORK HELPERS & MDNS AUTO-DISCOVERY
 # ==============================================================================
+
+MDNS_ADDR = "224.0.0.251"
+MDNS_PORT = 5353
+MDNS_SERVICE_MASTER = "_distcompute._tcp.local"
+MDNS_MASTER_FQDN = "distcompute-master.local"
+MDNS_SERVICE_WORKER = "_distworker._tcp.local"
+MDNS_WORKER_FQDN = "distcompute-worker.local"
+MDNS_KEYWORD = "distcompute"
+MDNS_KEYWORD_MASTER = "distcompute-master"
+MDNS_KEYWORD_WORKER = "distcompute-worker"
+
+
+def get_local_ip() -> str:
+    """Determine the local machine's primary outbound LAN IP."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
+
+
+def encode_dns_label(name: str) -> bytes:
+    """Encode a DNS name into label wire format (no compression)."""
+    out = b""
+    for part in name.rstrip(".").split("."):
+        enc = part.encode("utf-8")
+        out += bytes([len(enc)]) + enc
+    out += b"\x00"
+    return out
+
+
+def build_a_record(fqdn: str, ipv4: str, ttl: int = 4500) -> bytes:
+    """Return a DNS A-record answer RR in wire format."""
+    name = encode_dns_label(fqdn)
+    rdata = socket.inet_aton(ipv4)
+    rr = struct.pack("!HHIH", 1, 0x8001, ttl, 4)  # type A, class IN+flush
+    return name + rr + rdata
+
+
+def build_ptr_record(service: str, instance: str, ttl: int = 4500) -> bytes:
+    """Return a DNS PTR-record answer RR in wire format."""
+    name = encode_dns_label(service)
+    rdata = encode_dns_label(instance)
+    rr = struct.pack("!HHIH", 12, 0x0001, ttl, len(rdata))  # type PTR
+    return name + rr + rdata
+
+
+def build_mdns_announcement(
+    local_ip: str, fqdn: str = MDNS_MASTER_FQDN, service: str = MDNS_SERVICE_MASTER
+) -> bytes:
+    """Assemble a full mDNS (DNS-SD) response packet."""
+    a_rec = build_a_record(fqdn, local_ip)
+    ptr_rec = build_ptr_record(service, f"{fqdn.split('.')[0]}.{service}")
+
+    header = struct.pack(
+        "!HHHHHH",
+        0x0000,  # transaction id (always 0 for mDNS)
+        0x8400,  # flags: response + authoritative
+        0,       # questions
+        2,       # answer RRs
+        0,       # authority RRs
+        0,       # additional RRs
+    )
+    return header + ptr_rec + a_rec
+
+
+def parse_dns_name(data: bytes, offset: int) -> tuple[str, int]:
+    """Parse a DNS wire-format name starting at offset."""
+    labels = []
+    visited = set()
+
+    while True:
+        if offset >= len(data):
+            break
+        length = data[offset]
+
+        if length == 0:
+            offset += 1
+            break
+        elif (length & 0xC0) == 0xC0:
+            if offset + 1 >= len(data):
+                break
+            ptr = ((length & 0x3F) << 8) | data[offset + 1]
+            offset += 2
+            if ptr in visited:
+                break
+            visited.add(ptr)
+            label, _ = parse_dns_name(data, ptr)
+            labels.append(label)
+            break
+        else:
+            offset += 1
+            end = offset + length
+            labels.append(data[offset:end].decode("utf-8", errors="replace"))
+            offset = end
+
+    return ".".join(labels), offset
+
+
+def extract_a_record_ip(data: bytes, keyword: str = MDNS_KEYWORD_MASTER) -> str | None:
+    """Walk through DNS answer RRs looking for an A record whose name matches keyword."""
+    try:
+        if len(data) < 12:
+            return None
+        if keyword.encode("utf-8") not in data:
+            return None
+
+        qdcount = struct.unpack_from("!H", data, 4)[0]
+        ancount = struct.unpack_from("!H", data, 6)[0]
+
+        offset = 12
+        for _ in range(qdcount):
+            _, offset = parse_dns_name(data, offset)
+            offset += 4  # QTYPE + QCLASS
+
+        for _ in range(ancount):
+            name, offset = parse_dns_name(data, offset)
+            if offset + 10 > len(data):
+                break
+            rtype, rclass, ttl, rdlen = struct.unpack_from("!HHIH", data, offset)
+            offset += 10
+            rdata = data[offset : offset + rdlen]
+            offset += rdlen
+
+            if rtype == 1 and rdlen == 4:  # A record
+                ip = socket.inet_ntoa(rdata)
+                if keyword.lower() in name.lower():
+                    return ip
+    except Exception:
+        pass
+    return None
+
+
+def make_mdns_sender_socket() -> socket.socket:
+    """Create a UDP socket for sending mDNS multicast announcements."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except AttributeError:
+        pass
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+    except OSError:
+        pass
+    return sock
+
+
+def make_mdns_listener_socket() -> socket.socket:
+    """Create a UDP socket listening on the mDNS multicast group (224.0.0.251:5353)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except AttributeError:
+        pass
+    try:
+        sock.bind(("", MDNS_PORT))
+    except OSError:
+        sock.bind(("0.0.0.0", MDNS_PORT))
+
+    try:
+        mreq = struct.pack("4sL", socket.inet_aton(MDNS_ADDR), socket.INADDR_ANY)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    except OSError:
+        try:
+            local_ip = get_local_ip()
+            mreq = struct.pack("4s4s", socket.inet_aton(MDNS_ADDR), socket.inet_aton(local_ip))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except OSError:
+            pass
+    return sock
+
+
+class MdnsAnnouncer:
+    """Background thread announcing node presence over mDNS multicast."""
+
+    def __init__(
+        self,
+        local_ip: str | None = None,
+        fqdn: str = MDNS_MASTER_FQDN,
+        service: str = MDNS_SERVICE_MASTER,
+        interval_seconds: float = 2.0,
+    ) -> None:
+        self.local_ip = local_ip or get_local_ip()
+        self.fqdn = fqdn
+        self.service = service
+        self.interval_seconds = interval_seconds
+        self.running = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.running = True
+        self._thread = threading.Thread(target=self._announce_loop, daemon=True)
+        self._thread.start()
+
+    def _announce_loop(self) -> None:
+        packet = build_mdns_announcement(self.local_ip, self.fqdn, self.service)
+        try:
+            with make_mdns_sender_socket() as sock:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                except Exception:
+                    pass
+                while self.running:
+                    try:
+                        sock.sendto(packet, (MDNS_ADDR, MDNS_PORT))
+                    except Exception:
+                        pass
+                    try:
+                        sock.sendto(packet, ("255.255.255.255", MDNS_PORT))
+                    except Exception:
+                        pass
+                    try:
+                        sock.sendto(packet, ("127.0.0.1", MDNS_PORT))
+                    except Exception:
+                        pass
+                    time.sleep(self.interval_seconds)
+        except Exception:
+            pass
+
+    def stop(self) -> None:
+        self.running = False
+
+
+def discover_master_ip(timeout_seconds: float = 60.0) -> str:
+    """Listen on mDNS multicast group for Master announcement; return Master IP or raise TimeoutError after timeout."""
+    start_time = time.time()
+    deadline = start_time + timeout_seconds
+
+    with make_mdns_listener_socket() as sock:
+        sock.settimeout(1.0)
+        print(f"Searching for Master via mDNS on {MDNS_ADDR}:{MDNS_PORT} (timeout: {int(timeout_seconds)}s)...")
+        while time.time() < deadline:
+            try:
+                data, addr = sock.recvfrom(4096)
+                master_ip = extract_a_record_ip(data, MDNS_KEYWORD_MASTER)
+                if master_ip:
+                    print(f"\n[mDNS DISCOVERY] Master found at {master_ip}!")
+                    return master_ip
+            except socket.timeout:
+                continue
+            except Exception:
+                time.sleep(0.5)
+
+    raise TimeoutError(
+        f"No Master device found via mDNS within {int(timeout_seconds)} seconds!"
+    )
+
+
 
 def get_local_ip_for_peer(peer_ip_address: str) -> str:
     """Return the local IP address used to reach a peer on the LAN."""
@@ -183,6 +460,7 @@ def get_local_ip_for_peer(peer_ip_address: str) -> str:
         return connection.getsockname()[0]
     finally:
         connection.close()
+
 
 
 # ==============================================================================
@@ -730,6 +1008,99 @@ def _stderr_reader_thread(process: subprocess.Popen, state: dict, input_file: st
     process.stderr.close()
 
 
+class ProcessCpuTracker:
+    """Track system CPU usage and subprocess CPU usage over time."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.last_time = time.time()
+        self.num_cpus = os.cpu_count() or 1
+        self._last_sys_ticks = self._read_sys_ticks()
+        self._last_proc_ticks = self._read_proc_ticks()
+
+    def _read_sys_ticks(self) -> tuple[float, float] | None:
+        """Return (total_jiffies, idle_jiffies) from /proc/stat if available."""
+        try:
+            with open("/proc/stat", "r") as f:
+                line = f.readline()
+            if line.startswith("cpu "):
+                parts = [float(x) for x in line.split()[1:]]
+                total = sum(parts)
+                idle = parts[3] + (parts[4] if len(parts) > 4 else 0.0)
+                return total, idle
+        except Exception:
+            pass
+        return None
+
+    def _read_proc_ticks(self) -> float | None:
+        """Return total process jiffies from /proc/<pid>/stat if available."""
+        try:
+            with open(f"/proc/{self.pid}/stat", "r") as f:
+                content = f.read()
+            rparen_idx = content.rfind(")")
+            if rparen_idx != -1:
+                fields = content[rparen_idx + 1:].split()
+                utime = float(fields[11])
+                stime = float(fields[12])
+                cutime = float(fields[13])
+                cstime = float(fields[14])
+                return utime + stime + cutime + cstime
+        except Exception:
+            pass
+        return None
+
+    def get_cpu_usage(self) -> tuple[float, float, float]:
+        """Return (system_cpu_pct, process_cpu_pct, background_cpu_pct)."""
+        now = time.time()
+        dt = now - self.last_time
+        self.last_time = now
+
+        sys_ticks = self._read_sys_ticks()
+        proc_ticks = self._read_proc_ticks()
+
+        system_cpu_pct = 0.0
+        process_cpu_pct = 0.0
+
+        if sys_ticks is not None and self._last_sys_ticks is not None:
+            tot_diff = sys_ticks[0] - self._last_sys_ticks[0]
+            idle_diff = sys_ticks[1] - self._last_sys_ticks[1]
+            if tot_diff > 0:
+                system_cpu_pct = max(0.0, min(100.0, 100.0 * (1.0 - idle_diff / tot_diff)))
+
+            if proc_ticks is not None and self._last_proc_ticks is not None:
+                proc_diff = proc_ticks - self._last_proc_ticks
+                if tot_diff > 0:
+                    process_cpu_pct = max(0.0, min(100.0, 100.0 * (proc_diff / tot_diff)))
+            self._last_sys_ticks = sys_ticks
+            self._last_proc_ticks = proc_ticks
+        else:
+            try:
+                import psutil
+                system_cpu_pct = psutil.cpu_percent()
+                p = psutil.Process(self.pid)
+                process_cpu_pct = p.cpu_percent() / self.num_cpus
+            except Exception:
+                system_cpu_pct = 0.0
+                process_cpu_pct = 0.0
+
+        background_cpu_pct = max(0.0, system_cpu_pct - process_cpu_pct)
+        return system_cpu_pct, process_cpu_pct, background_cpu_pct
+
+
+def set_process_nice(pid: int, nice_value: int) -> bool:
+    """Set nice priority score for a process PID."""
+    try:
+        os.setpriority(os.PRIO_PROCESS, pid, nice_value)
+        return True
+    except Exception:
+        try:
+            import psutil
+            psutil.Process(pid).nice(nice_value)
+            return True
+        except Exception:
+            return False
+
+
 def run_execute_command(
     execute_command_template: str,
     input_file: str,
@@ -738,8 +1109,9 @@ def run_execute_command(
     connection: socket.socket | None = None,
     simulate_failure_after: float | None = None,
     progress_callback: Callable[[float], None] | None = None,
+    config: Config | None = None,
 ) -> float:
-    """Run execute_command on worker, show clean percentage & ETA progress, support 'k' kill and connection loss force-stop."""
+    """Run execute_command on worker, monitor CPU usage, support stepped nice throttling / process termination, and report progress."""
     Path(output_directory).mkdir(parents=True, exist_ok=True)
     resolved_command = build_execute_command(
         execute_command_template, input_file, output_directory, output_file
@@ -774,6 +1146,16 @@ def run_execute_command(
     )
     reader_thread.start()
 
+    tracker = ProcessCpuTracker(process.pid)
+    high_usage_start: float | None = None
+    low_usage_start: float | None = None
+    is_throttled = False
+    current_nice = 0
+    throttled_start_time: float | None = None
+    last_nice_check_time: float | None = None
+    last_bg_usage = 0.0
+    last_cpu_check_time = 0.0
+
     fd = None
     old_settings = None
     if sys.stdin.isatty():
@@ -791,18 +1173,113 @@ def run_execute_command(
     try:
         while True:
             return_code = process.poll()
-            elapsed_seconds = time.time() - start_time
+            now = time.time()
+            elapsed_seconds = now - start_time
             formatted_time = format_elapsed_time(elapsed_seconds)
+
+            # Resource monitoring check every second
+            if config is not None and now - last_cpu_check_time >= 1.0:
+                last_cpu_check_time = now
+                sys_pct, proc_pct, bg_pct = tracker.get_cpu_usage()
+
+                if bg_pct > config.cpu_threshold_percent:
+                    low_usage_start = None
+                    if high_usage_start is None:
+                        high_usage_start = now
+                    elif now - high_usage_start >= config.cpu_threshold_seconds:
+                        if config.on_high_usage == "kill":
+                            sys.stdout.write("\n")
+                            print(
+                                f"\n[RESOURCE ALERT] Background CPU usage ({bg_pct:.1f}%) exceeded threshold ({config.cpu_threshold_percent}%) for >{config.cpu_threshold_seconds}s! Killing task process..."
+                            )
+                            force_stop_process(process)
+                            raise RuntimeError(
+                                f"Task process killed: background CPU usage ({bg_pct:.1f}%) exceeded {config.cpu_threshold_percent}% for >{config.cpu_threshold_seconds}s"
+                            )
+                        elif config.on_high_usage == "throttle":
+                            if not is_throttled:
+                                is_throttled = True
+                                current_nice = config.nice_initial
+                                set_process_nice(process.pid, current_nice)
+                                throttled_start_time = now
+                                last_nice_check_time = now
+                                last_bg_usage = bg_pct
+                                sys.stdout.write("\n")
+                                print(
+                                    f"\n[RESOURCE ALERT] Background CPU usage ({bg_pct:.1f}%) high for >{config.cpu_threshold_seconds}s. Throttled PID {process.pid} (nice={current_nice})."
+                                )
+                            else:
+                                if (
+                                    last_nice_check_time is not None
+                                    and now - last_nice_check_time
+                                    >= config.nice_check_interval_seconds
+                                ):
+                                    last_nice_check_time = now
+                                    if bg_pct > last_bg_usage:
+                                        next_nice = min(
+                                            config.nice_max,
+                                            current_nice + config.nice_step,
+                                        )
+                                        if next_nice != current_nice:
+                                            current_nice = next_nice
+                                            set_process_nice(
+                                                process.pid, current_nice
+                                            )
+                                            sys.stdout.write("\n")
+                                            print(
+                                                f"\n[RESOURCE ALERT] Background CPU increased ({last_bg_usage:.1f}% -> {bg_pct:.1f}%). Escalated nice to {current_nice}."
+                                            )
+                                    last_bg_usage = bg_pct
+
+                                if (
+                                    throttled_start_time is not None
+                                    and now - throttled_start_time
+                                    >= config.max_throttle_duration_seconds
+                                ):
+                                    if not config.long_runnable:
+                                        sys.stdout.write("\n")
+                                        print(
+                                            f"\n[RESOURCE ALERT] Task throttled for >{config.max_throttle_duration_seconds}s and long_runnable is False! Killing task process..."
+                                        )
+                                        force_stop_process(process)
+                                        raise RuntimeError(
+                                            f"Task process killed: throttled for >{config.max_throttle_duration_seconds}s and long_runnable is False"
+                                        )
+                else:
+                    high_usage_start = None
+                    if is_throttled:
+                        if low_usage_start is None:
+                            low_usage_start = now
+                        elif (
+                            now - low_usage_start
+                            >= config.unthrottle_threshold_seconds
+                        ):
+                            is_throttled = False
+                            current_nice = 0
+                            set_process_nice(process.pid, 0)
+                            throttled_start_time = None
+                            last_nice_check_time = None
+                            low_usage_start = None
+                            sys.stdout.write("\n")
+                            print(
+                                f"\n[RESOURCE RECOVERY] Background CPU usage ({bg_pct:.1f}%) returned to normal. Restored nice to 0."
+                            )
 
             pct = state.get("pct")
             eta = state.get("eta")
 
+            status_prefix = (
+                f"{PROGRESS_EXECUTING} ({filename}) [throttled nice={current_nice}]"
+                if is_throttled
+                else f"{PROGRESS_EXECUTING} ({filename})"
+            )
+
             if pct is not None and eta is not None:
-                display_str = f"\r{PROGRESS_EXECUTING} ({filename}) - {pct:.1f}% [ETA: {eta}]   "
+                display_str = f"\r{status_prefix} - {pct:.1f}% [ETA: {eta}]   "
             elif pct is not None:
-                display_str = f"\r{PROGRESS_EXECUTING} ({filename}) - {pct:.1f}%   "
+                display_str = f"\r{status_prefix} - {pct:.1f}%   "
             else:
-                display_str = f"\r{PROGRESS_EXECUTING} ({filename}) - running time: {formatted_time}   "
+                display_str = f"\r{status_prefix} - running time: {formatted_time}   "
 
             sys.stdout.write(display_str)
             sys.stdout.flush()
@@ -838,6 +1315,7 @@ def run_execute_command(
                 raise KeyboardInterrupt(
                     f"Simulated failure triggered after {simulate_failure_after}s"
                 )
+
 
             if fd is not None:
                 rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
@@ -1056,16 +1534,43 @@ def run_merge_command(
 # ==============================================================================
 
 class StatusDashboard:
-    """Live CLI status view tracking master and per-node states."""
+    """Live CLI status view tracking master and per-node states as specified in idea.txt."""
 
     def __init__(self, master_state: str = "initializing") -> None:
         self.master_state = master_state
+        self.splitting_flag = False
+        self.merging_flag = False
         self.node_states: Dict[str, Dict[str, Any]] = {}
+        self.messages: list[dict] = []
+        self._last_render_time = time.time()
+
+    def add_message(self, text: str, timeout_seconds: int = 10) -> None:
+        """Add an event/alert message with a countdown period to the dashboard (idea.txt)."""
+        self.messages.append({"text": text, "time_left": float(timeout_seconds)})
+        self.render()
 
     def set_master_state(self, state: str) -> None:
         """Update overall master state (e.g. splitting file, merging files, finished)."""
         self.master_state = state
+        if state == PROGRESS_SPLITTING_FILE:
+            self.splitting_flag = True
+        elif state == PROGRESS_MERGING_FILES:
+            self.merging_flag = True
         self.render()
+
+    def update_node_flags(
+        self,
+        node_ip: str,
+        receiving: bool = False,
+        executing: bool = False,
+        sending: bool = False,
+    ) -> None:
+        """Update 3-phase node state flags (idea.txt)."""
+        if node_ip in self.node_states:
+            self.node_states[node_ip]["receiving"] = receiving
+            self.node_states[node_ip]["executing"] = executing
+            self.node_states[node_ip]["sending"] = sending
+            self.render()
 
     def update_node(
         self,
@@ -1076,8 +1581,16 @@ class StatusDashboard:
         elapsed_seconds: float | None = None,
         pct: float | None = None,
         eta: str | None = None,
+        receiving: bool | None = None,
+        executing: bool | None = None,
+        sending: bool | None = None,
     ) -> None:
-        """Update individual worker node state."""
+        """Update individual worker node state and flags."""
+        existing = self.node_states.get(node_ip, {})
+        rcv = receiving if receiving is not None else existing.get("receiving", False)
+        exc = executing if executing is not None else existing.get("executing", False)
+        snd = sending if sending is not None else existing.get("sending", False)
+
         self.node_states[node_ip] = {
             "node_id": node_id,
             "filename": filename,
@@ -1085,6 +1598,9 @@ class StatusDashboard:
             "elapsed": elapsed_seconds,
             "pct": pct,
             "eta": eta,
+            "receiving": rcv,
+            "executing": exc,
+            "sending": snd,
         }
         self.render()
 
@@ -1094,6 +1610,18 @@ class StatusDashboard:
         self.render()
 
     def render(self) -> None:
+        now = time.time()
+        dt = now - self._last_render_time
+        self._last_render_time = now
+
+        # Update message countdowns and clear expired messages (idea.txt)
+        updated_messages = []
+        for msg in self.messages:
+            msg["time_left"] -= dt
+            if msg["time_left"] > 0:
+                updated_messages.append(msg)
+        self.messages = updated_messages
+
         os.system("clear")
         """Render formatted CLI dashboard view."""
         header = f"=== MASTER DASHBOARD: [{self.master_state.upper()}] ==="
@@ -1101,7 +1629,7 @@ class StatusDashboard:
 
         lines = ["", divider, header, divider]
         lines.append(
-            f"{'NODE IP':<16} {'DEVICE':<10} {'PART FILE':<12} {'STATE':<16} {'PROGRESS / RUN TIME'}"
+            f"{'NODE IP':<16} {'DEVICE':<10} {'PART FILE':<12} {'STATE':<24} {'FLAGS [R/E/S]':<14} {'PROGRESS / RUN TIME'}"
         )
         lines.append("-" * len(header))
 
@@ -1113,6 +1641,10 @@ class StatusDashboard:
                 elapsed = info["elapsed"]
                 pct = info["pct"]
                 eta = info["eta"]
+                rcv = "R" if info.get("receiving") else "-"
+                exc = "E" if info.get("executing") else "-"
+                snd = "S" if info.get("sending") else "-"
+                flags_str = f"[{rcv}/{exc}/{snd}]"
 
                 prog_parts = []
                 if elapsed is not None:
@@ -1125,12 +1657,19 @@ class StatusDashboard:
 
                 prog_str = " ".join(prog_parts)
                 lines.append(
-                    f"{ip:<16} {info['node_id']:<10} {info['filename']:<12} {state_str:<16} {prog_str}"
+                    f"{ip:<16} {info['node_id']:<10} {info['filename']:<12} {state_str:<24} {flags_str:<14} {prog_str}"
                 )
 
+        if self.messages:
+            lines.append(divider)
+            lines.append("MESSAGES / ALERTS:")
+            for m in self.messages:
+                lines.append(f"  • {m['text']} ({int(m['time_left'])}s left)")
+
         lines.append(divider)
-        printlog("\n".join(lines)+"\n")
+        printlog("\n".join(lines) + "\n")
         print("\n".join(lines))
+
 
 
 # ==============================================================================
