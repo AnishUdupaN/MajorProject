@@ -10,5 +10,4 @@ idea.txt
 # Sensitive configuration and log files
 config.ini
 devices.json
-.env
 logs.txt
