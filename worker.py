@@ -20,14 +20,20 @@ from core import (
     MasterShutdownError,
     MdnsAnnouncer,
     cleanup_worker_temporary_files,
+    compute_md5,
     discover_master_ip,
+    get_worker_platform,
     load_config,
+    receive_binary_info_request,
+    receive_binary_ready,
     receive_ready_message,
     request_file,
     request_file_list,
+    resolve_worker_binary_cache_path,
     run_execute_command,
     get_shared_secret,
     send_auth_message,
+    send_binary_info,
     send_failed_message,
     send_file_received_message,
     send_finished_message,
@@ -86,6 +92,85 @@ def connect_to_master(
         connection.bind((bind_ip, 0))
     connection.connect((master_ip_address, port))
     return connection
+
+
+def do_binary_handshake(
+    connection: socket.socket,
+    master_ip_address: str,
+    config: "Config",
+) -> None:
+    """Phase 0 worker side: respond to master's binary check and fetch binary if needed.
+
+    Steps:
+      1. Receive binary_info_request from master (contains binary_name).
+      2. Detect own platform (os_folder, arch_folder).
+      3. Check local binary cache: worker/binaries/<os>/<arch>/<binary_name>.
+      4. Compute MD5 if the file exists.
+      5. Send binary_info to master (platform, has_binary, md5).
+      6. If master decides to send the binary: receive it via HTTP daemon
+         (master re-uses the existing ready/file_received protocol) and save
+         it to the local cache.
+      7. Wait for binary_ready from master before returning.
+
+    If require_binary is False or binary_name is empty, this function is a no-op.
+    """
+    if not config.require_binary or not config.binary_name:
+        return
+
+    # Step 1 — receive the request
+    req = receive_binary_info_request(connection)
+    binary_name = req["binary_name"]
+
+    # Step 2 — detect platform
+    os_folder, arch_folder = get_worker_platform()
+
+    # Step 3 & 4 — check local cache
+    cache_path = resolve_worker_binary_cache_path(os_folder, arch_folder, binary_name)
+    has_binary = cache_path.is_file()
+    local_md5 = compute_md5(str(cache_path)) if has_binary else None
+
+    print(
+        f"[BINARY] Platform: {os_folder}/{arch_folder}. "
+        f"Binary '{binary_name}': {'present (MD5=' + local_md5 + ')' if has_binary else 'not found'}."
+    )
+
+    # Step 5 — tell master
+    send_binary_info(connection, os_folder, arch_folder, binary_name, has_binary, local_md5)
+
+    # Step 6 — read master's next decision:
+    #   - MESSAGE_TYPE_BINARY_READY  → master confirmed we're good (skip transfer)
+    #   - MESSAGE_TYPE_READY         → master is sending the binary; fetch it via HTTP daemon
+    from core import receive_json_message, MESSAGE_TYPE_READY, MESSAGE_TYPE_BINARY_READY
+    msg = receive_json_message(connection)
+
+    if msg.get("type") == MESSAGE_TYPE_BINARY_READY:
+        # Master confirmed we already have it (or decided not to send)
+        print(f"[BINARY] Master acknowledged binary '{binary_name}'. Proceeding.")
+        return
+
+    if msg.get("type") == MESSAGE_TYPE_READY:
+        # Master is sending the binary — download it like a regular part file
+        file_transfer_port = msg["file_transfer_port"]
+        master_addr = msg.get("master_ip_address", master_ip_address)
+        print(f"[BINARY] Receiving binary '{binary_name}' from master on port {file_transfer_port}...")
+        allocated_files = request_file_list(master_addr, file_transfer_port)
+        for fname in allocated_files:
+            dest = request_file(master_addr, file_transfer_port, fname, str(cache_path.parent))
+            # Rename to the expected binary name if daemon served it under original name
+            dest_path = Path(dest)
+            expected = cache_path.parent / binary_name
+            if dest_path != expected and dest_path.is_file():
+                dest_path.rename(expected)
+        send_file_received_message(connection)
+        print(f"[BINARY] Binary '{binary_name}' saved to {cache_path}. ✓")
+
+        # Step 7 — wait for binary_ready
+        receive_binary_ready(connection)
+        print("[BINARY] Binary ready confirmed.")
+        return
+
+    raise ValueError(f"[BINARY] Unexpected message during binary handshake: {msg!r}")
+
 
 
 
@@ -265,6 +350,8 @@ def run_worker() -> None:
                     # VULN-08: Send shared secret for authentication if configured
                     if shared_secret:
                         send_auth_message(connection, shared_secret)
+                    # Phase 0: Perform binary handshake (no-op if require_binary=false)
+                    do_binary_handshake(connection, master_ip_address, config)
                     reconnect_start_time = None
                 except OSError as exc:
                     print(f"Connection attempt failed ({exc}). Retrying in 2 seconds...", file=sys.stderr)

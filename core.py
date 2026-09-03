@@ -6,8 +6,10 @@ HTTP file transfers, task execution monitoring, video splitting/merging, and UI 
 import argparse
 import atexit
 import configparser
+import hashlib
 import json
 import os
+import platform
 import re
 import select
 import shlex
@@ -62,6 +64,10 @@ MESSAGE_TYPE_FINISHED = "finished"
 MESSAGE_TYPE_FAILED = "failed"
 MESSAGE_TYPE_SHUTDOWN = "shutdown"
 MESSAGE_TYPE_AUTH = "auth"
+# Binary handshake message types
+MESSAGE_TYPE_BINARY_INFO_REQUEST = "binary_info_request"
+MESSAGE_TYPE_BINARY_INFO = "binary_info"
+MESSAGE_TYPE_BINARY_READY = "binary_ready"
 
 # Message schema validation: required keys for each message type.
 MESSAGE_REQUIRED_KEYS = {
@@ -71,6 +77,10 @@ MESSAGE_REQUIRED_KEYS = {
     MESSAGE_TYPE_FAILED: ['type', 'reason'],
     MESSAGE_TYPE_SHUTDOWN: ['type'],
     MESSAGE_TYPE_AUTH: ['type', 'secret'],
+    # Binary handshake schemas
+    MESSAGE_TYPE_BINARY_INFO_REQUEST: ['type', 'binary_name'],
+    MESSAGE_TYPE_BINARY_INFO: ['type', 'os_name', 'arch', 'binary_name', 'has_binary', 'md5'],
+    MESSAGE_TYPE_BINARY_READY: ['type'],
 }
 
 
@@ -125,8 +135,152 @@ MASTER_INPUT_DIRECTORY = f"{MASTER_DIRECTORY}/input"
 MASTER_OUTPUT_DIRECTORY = f"{MASTER_DIRECTORY}/output"
 WORKER_INPUT_DIRECTORY = f"{WORKER_DIRECTORY}/input"
 WORKER_OUTPUT_DIRECTORY = f"{WORKER_DIRECTORY}/output"
+WORKER_BINARY_DIRECTORY = f"{WORKER_DIRECTORY}/binaries"
 
 DEFAULT_INPUT_VIDEO = f"{MASTER_INPUT_DIRECTORY}/input.mkv"
+
+
+# ==============================================================================
+# SECTION 1b: BINARY DISTRIBUTION HELPERS
+# ==============================================================================
+
+# Mapping from (platform.system(), platform.machine()) → (os_folder, arch_folder)
+# used to locate binaries under binaries/<os>/<arch>/
+BINARY_PLATFORM_MAP: dict[tuple[str, str], tuple[str, str]] = {
+    ("Windows", "AMD64"):   ("win",   "x64"),
+    ("Windows", "x86_64"):  ("win",   "x64"),
+    ("Windows", "ARM64"):   ("win",   "aarch64"),
+    ("Linux",   "x86_64"):  ("linux", "x64"),
+    ("Linux",   "aarch64"): ("linux", "aarch64"),
+    ("Linux",   "arm64"):   ("linux", "aarch64"),
+    ("Darwin",  "x86_64"):  ("mac",   "x64"),
+    ("Darwin",  "arm64"):   ("mac",   "aarch64"),
+    ("Darwin",  "aarch64"): ("mac",   "aarch64"),
+}
+
+
+def get_worker_platform() -> tuple[str, str]:
+    """Return (os_folder, arch_folder) for the current machine, e.g. ('linux', 'x64').
+
+    Falls back to (platform.system().lower(), platform.machine().lower()) if the
+    combination is not in BINARY_PLATFORM_MAP.
+    """
+    sys_name = platform.system()
+    machine = platform.machine()
+    key = (sys_name, machine)
+    if key in BINARY_PLATFORM_MAP:
+        return BINARY_PLATFORM_MAP[key]
+    # Graceful fallback
+    return sys_name.lower(), machine.lower()
+
+
+def compute_md5(filepath: str | Path) -> str:
+    """Compute the MD5 hex digest of a file using chunked reads (memory-efficient).
+
+    MD5 is chosen because it is natively available in Python's hashlib on all
+    platforms (unlike MD4, which was removed from OpenSSL), and hashing a typical
+    binary (~50 MB) takes well under 100 ms — fast enough for a pre-task handshake.
+    """
+    h = hashlib.md5()
+    with open(filepath, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def get_binary_path(
+    binaries_directory: str,
+    os_folder: str,
+    arch_folder: str,
+    binary_name: str,
+) -> Path | None:
+    """Return the Path to the binary for the given OS/arch, or None if not found.
+
+    On Windows the function also tries appending '.exe' if the bare name is absent.
+    """
+    base = Path(binaries_directory) / os_folder / arch_folder / binary_name
+    if base.is_file():
+        return base
+    # Windows: try with .exe extension
+    if os_folder == "win":
+        exe = base.with_suffix(".exe")
+        if exe.is_file():
+            return exe
+    return None
+
+
+def resolve_worker_binary_cache_path(
+    os_folder: str,
+    arch_folder: str,
+    binary_name: str,
+) -> Path:
+    """Return the expected local cache path for a binary on a worker node.
+
+    Path: worker/binaries/<os_folder>/<arch_folder>/<binary_name>
+    The directory is created automatically if it doesn't exist.
+    """
+    cache_dir = Path(WORKER_BINARY_DIRECTORY) / os_folder / arch_folder
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / binary_name
+
+
+# ------ Binary handshake messaging functions ------
+
+def send_binary_info_request(connection: socket.socket, binary_name: str) -> None:
+    """Master asks a worker for its platform info and whether it has the binary."""
+    send_json_message(connection, {
+        "type": MESSAGE_TYPE_BINARY_INFO_REQUEST,
+        "binary_name": binary_name,
+    })
+
+
+def receive_binary_info_request(connection: socket.socket) -> dict:
+    """Worker receives the master's binary_info_request message."""
+    msg = receive_json_message(connection)
+    if msg.get("type") != MESSAGE_TYPE_BINARY_INFO_REQUEST:
+        raise ValueError(f"Expected binary_info_request message, got: {msg!r}")
+    return msg
+
+
+def send_binary_info(
+    connection: socket.socket,
+    os_name: str,
+    arch: str,
+    binary_name: str,
+    has_binary: bool,
+    md5: str | None,
+) -> None:
+    """Worker replies with its platform and binary status (md5 is None if absent)."""
+    send_json_message(connection, {
+        "type": MESSAGE_TYPE_BINARY_INFO,
+        "os_name": os_name,
+        "arch": arch,
+        "binary_name": binary_name,
+        "has_binary": has_binary,
+        "md5": md5 or "",
+    })
+
+
+def receive_binary_info(connection: socket.socket) -> dict:
+    """Master receives the worker's binary_info message."""
+    msg = receive_json_message(connection)
+    if msg.get("type") != MESSAGE_TYPE_BINARY_INFO:
+        raise ValueError(f"Expected binary_info message, got: {msg!r}")
+    return msg
+
+
+def send_binary_ready(connection: socket.socket) -> None:
+    """Master tells the worker that binary setup is complete (present or just sent)."""
+    send_json_message(connection, {"type": MESSAGE_TYPE_BINARY_READY})
+
+
+def receive_binary_ready(connection: socket.socket) -> None:
+    """Worker waits for the master's binary_ready signal before proceeding."""
+    msg = receive_json_message(connection)
+    if msg.get("type") != MESSAGE_TYPE_BINARY_READY:
+        raise ValueError(f"Expected binary_ready message, got: {msg!r}")
+
+
 
 
 # ==============================================================================
@@ -150,6 +304,11 @@ class Config:
     nice_check_interval_seconds: float = 60.0
     max_throttle_duration_seconds: float = 600.0
     unthrottle_threshold_seconds: float = 20.0
+    # Binary distribution settings
+    binary_name: str = ""
+    binaries_directory: str = "binaries"
+    require_binary: bool = False
+
 
 _LOG_LOCK = threading.Lock()
 
@@ -206,7 +365,11 @@ def load_config(config_path: str) -> Config:
         nice_check_interval_seconds=section.getfloat("nice_check_interval_seconds", fallback=60.0),
         max_throttle_duration_seconds=section.getfloat("max_throttle_duration_seconds", fallback=600.0),
         unthrottle_threshold_seconds=section.getfloat("unthrottle_threshold_seconds", fallback=20.0),
+        binary_name=section.get("binary_name", "").strip(),
+        binaries_directory=section.get("binaries_directory", "binaries").strip(),
+        require_binary=section.getboolean("require_binary", fallback=False),
     )
+
 
 
 # ==============================================================================

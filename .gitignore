@@ -6,6 +6,7 @@ filelist.txt
 master
 worker
 idea.txt
+.tasks.txt
 
 # Sensitive configuration and log files
 config.ini

@@ -25,14 +25,19 @@ from core import (
     MdnsAnnouncer,
     StatusDashboard,
     cleanup_master_temporary_files,
+    compute_md5,
+    get_binary_path,
     get_local_ip_for_peer,
     has_buffered_message,
     load_config,
     part_filename_for_node,
+    receive_binary_info,
     receive_file_received_message,
     receive_json_message,
     run_merge_command,
     run_split_command,
+    send_binary_info_request,
+    send_binary_ready,
     send_ready_message,
     send_shutdown_message,
     start_file_transfer_daemon,
@@ -41,7 +46,7 @@ from core import (
     write_devices_json,
     printlog,
     get_shared_secret,
-    verify_auth_message
+    verify_auth_message,
 )
 
 # clean the old log file
@@ -731,6 +736,161 @@ def monitor_worker_executions_and_collect_results(
     return active_daemons
 
 
+def check_and_distribute_binaries(
+    active_nodes: list[str],
+    worker_pool: "WorkerConnectionPool",
+    config: "Config",
+    master_ip_address: str | None = None,
+    dashboard: "StatusDashboard | None" = None,
+) -> tuple[list[str], list[str]]:
+    """Phase 0: Check binary presence on each worker, transfer if needed.
+
+    Returns (binary_ready, binary_idle):
+      - binary_ready: workers that have the correct binary (MD5-verified) or just received it.
+      - binary_idle: workers kept idle because user declined transfer, master lacked the binary,
+                     or a handshake error occurred.
+
+    For each worker:
+      1. Send binary_info_request (name of required binary).
+
+      2. Receive binary_info (worker OS/arch, whether it has the binary, its MD5).
+      3. Compare MD5 with the master's copy. If they match, skip transfer.
+      4. If worker is missing the binary (or has a stale one):
+           - Prompt user interactively: "Send binary to <ip>? [y/n]"
+           - If y: start a file-transfer daemon, send the binary, wait for confirmation.
+           - If n: mark worker as "binary_idle" — keep it in the pool but skip for tasks.
+      5. Send binary_ready to every worker that now has a good binary.
+    After processing all workers, re-sort active_nodes so binary-ready ones lead,
+    and return only that re-sorted list (binary_idle workers are silently moved to
+    spare and remain connected but receive no tasks).
+    """
+    if not config.require_binary or not config.binary_name:
+        # Binary distribution disabled; all nodes are ready as-is.
+        return active_nodes
+
+    printlog("\n--- Phase 0: Binary Check & Distribution ---")
+    if dashboard:
+        dashboard.set_master_state("checking binaries")
+
+    binary_ready: list[str] = []    # workers that have (or will have) the binary
+    binary_idle: list[str] = []     # workers skipped by user — stay idle
+
+    for worker_ip in active_nodes:
+        try:
+            connection = worker_pool.get_connection(worker_ip, timeout_seconds=15.0)
+
+            # Step 1 — ask worker for its platform + binary status
+            send_binary_info_request(connection, config.binary_name)
+
+            # Step 2 — receive worker's platform + binary status
+            info = receive_binary_info(connection)
+            os_folder = info["os_name"]
+            arch_folder = info["arch"]
+            worker_has = info["has_binary"]
+            worker_md5 = info.get("md5", "")
+
+            # Step 3 — locate master's binary for that platform
+            master_binary_path = get_binary_path(
+                config.binaries_directory, os_folder, arch_folder, config.binary_name
+            )
+
+            if master_binary_path is None:
+                printlog(
+                    f"[BINARY] No binary for {os_folder}/{arch_folder} on master. "
+                    f"Worker {worker_ip} will be kept idle."
+                )
+                print(
+                    f"\n[BINARY] Master has no binary for {os_folder}/{arch_folder}. "
+                    f"Worker {worker_ip} kept idle."
+                )
+                binary_idle.append(worker_ip)
+                # No binary_ready sent — worker stays blocked until task phase ignores it
+                continue
+
+            master_md5 = compute_md5(str(master_binary_path))
+
+            # Step 4 — decide if transfer is needed
+            if worker_has and worker_md5 == master_md5:
+                printlog(f"[BINARY] Worker {worker_ip} already has {config.binary_name} (MD5 match). Skipping transfer.")
+                print(f"  [BINARY] Worker {worker_ip}: {config.binary_name} up-to-date. ✓")
+                send_binary_ready(connection)
+                binary_ready.append(worker_ip)
+                continue
+
+            # Worker is missing the binary or has a stale version — prompt user
+            reason = "stale/different version" if worker_has else "not present"
+            print(f"\n[BINARY] Worker {worker_ip} ({os_folder}/{arch_folder}): "
+                  f"'{config.binary_name}' {reason}.")
+            print(f"  Binary to send: {master_binary_path} ({master_binary_path.stat().st_size // 1024} KB)")
+            sys.stdout.write(f"  Send binary to {worker_ip}? [y/n]: ")
+            sys.stdout.flush()
+
+            # Read single-char answer (works in both tty and pipe)
+            user_choice = ""
+            if sys.stdin.isatty():
+                try:
+                    import termios, tty as _tty
+                    fd = sys.stdin.fileno()
+                    old = termios.tcgetattr(fd)
+                    _tty.setcbreak(fd)
+                    try:
+                        user_choice = sys.stdin.read(1).lower()
+                        print(user_choice)
+                    finally:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                except Exception:
+                    user_choice = sys.stdin.readline().strip().lower()[:1]
+            else:
+                user_choice = sys.stdin.readline().strip().lower()[:1]
+
+            if user_choice != "y":
+                printlog(f"[BINARY] User declined to send binary to {worker_ip}. Worker kept idle.")
+                print(f"  [BINARY] Skipped. Worker {worker_ip} will be kept idle.")
+                binary_idle.append(worker_ip)
+                # Don't send binary_ready — worker stays blocked waiting
+                continue
+
+            # User said yes — transfer binary via HTTP daemon
+            printlog(f"[BINARY] Transferring {config.binary_name} to {worker_ip} ({os_folder}/{arch_folder})...")
+            print(f"  [BINARY] Sending {config.binary_name} to {worker_ip}...")
+            if dashboard:
+                dashboard.add_message(f"Sending binary '{config.binary_name}' to {worker_ip}", timeout_seconds=30)
+
+            reachable_master_ip = master_ip_address or get_local_ip_for_peer(worker_ip)
+            binary_daemon = start_file_transfer_daemon(
+                allocated_filenames=[master_binary_path.name],
+                serve_directory=str(master_binary_path.parent),
+                output_directory=str(master_binary_path.parent),
+            )
+            if binary_daemon.port is None:
+                raise RuntimeError("Binary file-transfer daemon did not report a port")
+
+            # Tell the worker to fetch the binary, then send binary_ready
+            send_ready_message(connection, reachable_master_ip, binary_daemon.port)
+            receive_file_received_message(connection)
+            send_binary_ready(connection)
+            binary_daemon.stop()
+
+            printlog(f"[BINARY] Binary sent to {worker_ip}. MD5={master_md5}")
+            print(f"  [BINARY] Transfer complete. Worker {worker_ip} is ready. ✓")
+            binary_ready.append(worker_ip)
+
+        except (TimeoutError, ConnectionError, OSError, RuntimeError, ValueError) as exc:
+            printlog(f"[BINARY] Error during binary handshake with {worker_ip}: {exc}")
+            print(f"  [BINARY] Binary handshake failed for {worker_ip}: {exc}. Kept idle.")
+            binary_idle.append(worker_ip)
+
+    printlog(
+        f"[BINARY] Phase 0 complete. "
+        f"Ready: {binary_ready}, Idle (no binary): {binary_idle}"
+    )
+    if binary_idle:
+        print(f"\n[BINARY] Workers kept idle (no binary): {', '.join(binary_idle)}")
+    # Return both lists: caller uses binary_ready for tasks, binary_idle stays connected but idle.
+    return binary_ready, binary_idle
+
+
+
 def run_master() -> None:
     """Load config, validate addresses, split video, distribute parts, track execution, collect results, and merge."""
     arguments = parse_master_arguments()
@@ -740,6 +900,7 @@ def run_master() -> None:
     except ValueError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         sys.exit(1)
+
 
     try:
         validate_worker_address_count(
@@ -912,6 +1073,23 @@ def run_master() -> None:
         for ip in active_nodes:
             worker_pool.get_connection(ip)
         print("All active workers connected!")
+
+        # Phase 0: Binary check & distribution (returns binary_ready, binary_idle)
+        binary_ready_nodes, binary_idle_nodes = check_and_distribute_binaries(
+            active_nodes,
+            worker_pool,
+            config,
+            master_ip_address=arguments.master_ip,
+            dashboard=dashboard,
+        )
+        # Only binary-ready workers participate in task execution.
+        # binary_idle workers remain connected in the pool but receive no tasks.
+        active_nodes = binary_ready_nodes
+        if not active_nodes:
+            print("[BINARY] No workers have the required binary. Cannot proceed.", file=sys.stderr)
+            sys.exit(1)
+
+
 
         dashboard.set_master_state("splitting file")
         run_split_command(
