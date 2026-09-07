@@ -26,6 +26,7 @@ from core import (
     StatusDashboard,
     cleanup_master_temporary_files,
     compute_md5,
+    get_available_configs,
     get_binary_path,
     get_local_ip_for_peer,
     has_buffered_message,
@@ -205,8 +206,8 @@ def parse_master_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default="config.ini",
-        help="Path to the config file (default: config.ini)",
+        default=None,
+        help="Path to initial config file (optional; config is selected interactively on dashboard)",
     )
     parser.add_argument(
         "--master-ip",
@@ -766,7 +767,7 @@ def check_and_distribute_binaries(
     """
     if not config.require_binary or not config.binary_name:
         # Binary distribution disabled; all nodes are ready as-is.
-        return active_nodes
+        return active_nodes, []
 
     printlog("\n--- Phase 0: Binary Check & Distribution ---")
     if dashboard:
@@ -892,23 +893,21 @@ def check_and_distribute_binaries(
 
 
 def run_master() -> None:
-    """Load config, validate addresses, split video, distribute parts, track execution, collect results, and merge."""
+    """Load config from dashboard selection, validate addresses, split video, distribute parts, track execution, collect results, and merge."""
     arguments = parse_master_arguments()
 
-    try:
-        config = load_config(arguments.config)
-    except ValueError as exc:
-        print(f"Config error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    # Discover available config files and determine initial selection
+    available_configs = get_available_configs()
+    if arguments.config:
+        try:
+            initial_config = str(Path(arguments.config).resolve().relative_to(Path(".").resolve()))
+        except ValueError:
+            initial_config = arguments.config
+    else:
+        initial_config = "config.ini" if "config.ini" in available_configs else available_configs[0]
 
-
-    try:
-        validate_worker_address_count(
-            arguments.worker_ip_addresses, config.min_devices
-        )
-    except ValueError as exc:
-        print(f"Startup error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    if initial_config not in available_configs:
+        available_configs.insert(0, initial_config)
 
     # master/input holds split parts; master/output holds merged results.
     Path(arguments.parts_directory).mkdir(parents=True, exist_ok=True)
@@ -920,9 +919,9 @@ def run_master() -> None:
     )
     mdns_announcer.start()
 
-    dashboard = StatusDashboard(master_state="initializing")
+    dashboard = StatusDashboard(master_state="device & config selection")
+    dashboard.set_available_configs(available_configs, selected=initial_config)
 
-    print(f"Loaded config from {arguments.config}")
     print(f"Listening on control port {CONTROL_PORT}...")
 
     daemons: list[FileTransferDaemon] = []
@@ -962,12 +961,9 @@ def run_master() -> None:
     except Exception:
         pass
 
-    if arguments.worker_ip_addresses:
-        active_nodes, spare_nodes = split_active_and_spare_addresses(
-            arguments.worker_ip_addresses, config.max_nodes
-        )
-    else:
-        dashboard.set_master_state("discovering workers")
+    if not arguments.worker_ip_addresses:
+        # Device & Config Selection Phase on Dashboard (mDNS Discovery)
+        dashboard.set_master_state("device & config selection")
         start_time = time.time()
         timeout_seconds = 60.0
         deadline = start_time + timeout_seconds
@@ -987,15 +983,16 @@ def run_master() -> None:
                 old_settings = None
 
         try:
-            print("mDNS Worker Discovery active. Press 'y' to start task execution when ready...")
+            print("Device & Config Selection active. Press 'c' to cycle config, '1'-'9' to select config, 'y' to continue, 'q' to quit...")
             while True:
                 now = time.time()
                 remaining = int(max(0.0, deadline - now))
                 with worker_pool.lock:
                     connected_ips = list(worker_pool.connections.keys())
 
+                sel_cfg = dashboard.get_selected_config()
                 dashboard.add_message(
-                    f"Discovered {len(connected_ips)} worker(s). Press 'y' to start processing, 'q' to quit ({remaining}s remaining)",
+                    f"Discovered {len(connected_ips)} worker(s). Config: '{sel_cfg}'. Press 'c'/'1'-'{len(available_configs)}' to change config, 'y' to continue, 'q' to quit ({remaining}s remaining)",
                     timeout_seconds=2,
                 )
 
@@ -1008,12 +1005,17 @@ def run_master() -> None:
                                 dashboard.add_message("Cannot start: 0 workers discovered yet! Waiting...", timeout_seconds=5)
                             else:
                                 break
+                        elif char == "c":
+                            new_cfg = dashboard.select_next_config()
+                            dashboard.add_message(f"Selected config: {new_cfg}", timeout_seconds=3)
+                        elif char.isdigit() and 1 <= int(char) <= len(available_configs):
+                            new_cfg = dashboard.select_config_by_index(int(char) - 1)
+                            dashboard.add_message(f"Selected config: {new_cfg}", timeout_seconds=3)
                         elif char == "q":
-                            print("\nUser pressed 'q'. Exiting discovery...")
+                            print("\nUser pressed 'q'. Exiting selection...")
                             sys.exit(0)
                 else:
                     if connected_ips:
-                        print(f"\nAuto-discovered workers: {connected_ips}")
                         break
 
                 if now >= deadline:
@@ -1025,7 +1027,7 @@ def run_master() -> None:
                         sys.exit(0)
                     else:
                         print(
-                            f"\n[DISCOVERY TIMEOUT] Timeout reached ({int(timeout_seconds)}s). Proceeding with {len(connected_ips)} discovered worker(s)."
+                            f"\n[SELECTION TIMEOUT] Timeout reached ({int(timeout_seconds)}s). Proceeding with selected config '{sel_cfg}'."
                         )
                         break
                 time.sleep(0.5)
@@ -1038,16 +1040,35 @@ def run_master() -> None:
                 except Exception:
                     pass
 
-        with worker_pool.lock:
-            connected_ips = list(worker_pool.connections.keys())
+    # Load selected config after device selection phase
+    selected_config_path = dashboard.get_selected_config()
+    try:
+        config = load_config(selected_config_path)
+    except ValueError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-        if len(connected_ips) >= config.max_nodes:
-            active_nodes, spare_nodes = split_active_and_spare_addresses(
-                connected_ips, config.max_nodes
-            )
-        else:
-            active_nodes = connected_ips
-            spare_nodes = []
+    print(f"Loaded config from {selected_config_path}")
+
+    with worker_pool.lock:
+        connected_ips = list(worker_pool.connections.keys())
+
+    if arguments.worker_ip_addresses:
+        worker_addresses_to_use = arguments.worker_ip_addresses
+    else:
+        worker_addresses_to_use = connected_ips
+
+    try:
+        validate_worker_address_count(
+            worker_addresses_to_use, config.min_devices
+        )
+    except ValueError as exc:
+        print(f"Startup error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    active_nodes, spare_nodes = split_active_and_spare_addresses(
+        worker_addresses_to_use, config.max_nodes
+    )
 
     device_mapping = write_devices_json(active_nodes)
     print(f"Active nodes ({len(active_nodes)}): {', '.join(active_nodes)}")

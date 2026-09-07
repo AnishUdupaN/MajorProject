@@ -7,6 +7,10 @@ master
 worker
 idea.txt
 .tasks.txt
+binaries
+.binaries
+blender-projects
+new-idea.txt
 
 # Sensitive configuration and log files
 config.ini

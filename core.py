@@ -145,33 +145,24 @@ DEFAULT_INPUT_VIDEO = f"{MASTER_INPUT_DIRECTORY}/input.mkv"
 # ==============================================================================
 
 # Mapping from (platform.system(), platform.machine()) → (os_folder, arch_folder)
-# used to locate binaries under binaries/<os>/<arch>/
+# supported targets: linux (x64) and macos (aarch64)
 BINARY_PLATFORM_MAP: dict[tuple[str, str], tuple[str, str]] = {
-    ("Windows", "AMD64"):   ("win",   "x64"),
-    ("Windows", "x86_64"):  ("win",   "x64"),
-    ("Windows", "ARM64"):   ("win",   "aarch64"),
     ("Linux",   "x86_64"):  ("linux", "x64"),
-    ("Linux",   "aarch64"): ("linux", "aarch64"),
-    ("Linux",   "arm64"):   ("linux", "aarch64"),
-    ("Darwin",  "x86_64"):  ("mac",   "x64"),
-    ("Darwin",  "arm64"):   ("mac",   "aarch64"),
-    ("Darwin",  "aarch64"): ("mac",   "aarch64"),
+    ("Darwin",  "arm64"):   ("macos", "aarch64"),
+    ("Darwin",  "aarch64"): ("macos", "aarch64"),
 }
 
 
 def get_worker_platform() -> tuple[str, str]:
-    """Return (os_folder, arch_folder) for the current machine, e.g. ('linux', 'x64').
-
-    Falls back to (platform.system().lower(), platform.machine().lower()) if the
-    combination is not in BINARY_PLATFORM_MAP.
-    """
+    """Return (os_folder, arch_folder) for supported worker platform targets."""
     sys_name = platform.system()
     machine = platform.machine()
     key = (sys_name, machine)
     if key in BINARY_PLATFORM_MAP:
         return BINARY_PLATFORM_MAP[key]
-    # Graceful fallback
-    return sys_name.lower(), machine.lower()
+    os_folder = "macos" if sys_name == "Darwin" else sys_name.lower()
+    arch_folder = "aarch64" if machine in ("arm64", "aarch64") else ("x64" if machine in ("x86_64", "AMD64") else machine.lower())
+    return os_folder, arch_folder
 
 
 def compute_md5(filepath: str | Path) -> str:
@@ -196,16 +187,29 @@ def get_binary_path(
 ) -> Path | None:
     """Return the Path to the binary for the given OS/arch, or None if not found.
 
-    On Windows the function also tries appending '.exe' if the bare name is absent.
+    Supports layout:
+      <binaries_directory>/<binary_name>/<os_folder>/<binary_name>
+    as well as fallback legacy layout:
+      <binaries_directory>/<os_folder>/<arch_folder>/<binary_name>
     """
-    base = Path(binaries_directory) / os_folder / arch_folder / binary_name
-    if base.is_file():
-        return base
-    # Windows: try with .exe extension
-    if os_folder == "win":
-        exe = base.with_suffix(".exe")
-        if exe.is_file():
-            return exe
+    # Primary directory layout: binaries/<binary_name>/<os_folder>/<binary_name>
+    primary = Path(binaries_directory) / binary_name / os_folder / binary_name
+    if primary.is_file():
+        return primary
+
+    # Secondary check: if there is a directory or executable matching under primary parent
+    primary_dir = Path(binaries_directory) / binary_name / os_folder
+    if primary_dir.is_dir():
+        # Check for executable/file in primary_dir (e.g., blender executable or app)
+        for item in primary_dir.iterdir():
+            if item.is_file() and not item.name.startswith("."):
+                return item
+
+    # Legacy fallback: binaries/<os_folder>/<arch_folder>/<binary_name>
+    legacy = Path(binaries_directory) / os_folder / arch_folder / binary_name
+    if legacy.is_file():
+        return legacy
+
     return None
 
 
@@ -216,10 +220,10 @@ def resolve_worker_binary_cache_path(
 ) -> Path:
     """Return the expected local cache path for a binary on a worker node.
 
-    Path: worker/binaries/<os_folder>/<arch_folder>/<binary_name>
+    Path: worker/binaries/<binary_name>/<os_folder>/<binary_name>
     The directory is created automatically if it doesn't exist.
     """
-    cache_dir = Path(WORKER_BINARY_DIRECTORY) / os_folder / arch_folder
+    cache_dir = Path(WORKER_BINARY_DIRECTORY) / binary_name / os_folder
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / binary_name
 
@@ -316,6 +320,42 @@ def printlog(st):
     with _LOG_LOCK:
         with open("logs.txt", "a+") as f:
             f.write(st + "\n")
+
+
+def get_available_configs(base_dir: str | Path = ".") -> list[str]:
+    """Discover available .ini configuration files in root and config/ directory."""
+    base_path = Path(base_dir).resolve()
+    configs = []
+
+    # Check root config.ini
+    root_ini = base_path / "config.ini"
+    if root_ini.is_file():
+        configs.append("config.ini")
+
+    # Check config/ directory
+    config_dir = base_path / "config"
+    if config_dir.is_dir():
+        for file in sorted(config_dir.glob("*.ini")):
+            try:
+                rel_path = str(file.relative_to(base_path))
+            except ValueError:
+                rel_path = file.name
+            if rel_path not in configs:
+                configs.append(rel_path)
+
+    # Check any other root *.ini files
+    for file in sorted(base_path.glob("*.ini")):
+        try:
+            rel_path = str(file.relative_to(base_path))
+        except ValueError:
+            rel_path = file.name
+        if rel_path not in configs:
+            configs.append(rel_path)
+
+    if not configs:
+        configs.append("config.ini")
+
+    return configs
 
 
 def load_config(config_path: str) -> Config:
@@ -1979,6 +2019,41 @@ class StatusDashboard:
         self.node_states: Dict[str, Dict[str, Any]] = {}
         self.messages: list[dict] = []
         self._last_render_time = time.time()
+        self.available_configs: list[str] = []
+        self.selected_config_index: int = 0
+
+    def set_available_configs(self, configs: list[str], selected: str | None = None) -> None:
+        """Set available config paths and initial selection."""
+        with self.lock:
+            self.available_configs = list(configs)
+            if selected and selected in self.available_configs:
+                self.selected_config_index = self.available_configs.index(selected)
+            else:
+                self.selected_config_index = 0
+            self._render_unlocked()
+
+    def select_next_config(self) -> str:
+        """Cycle to the next available config file."""
+        with self.lock:
+            if self.available_configs:
+                self.selected_config_index = (self.selected_config_index + 1) % len(self.available_configs)
+            self._render_unlocked()
+            return self.get_selected_config()
+
+    def select_config_by_index(self, index: int) -> str:
+        """Select a config file by its 0-based index."""
+        with self.lock:
+            if self.available_configs and 0 <= index < len(self.available_configs):
+                self.selected_config_index = index
+            self._render_unlocked()
+            return self.get_selected_config()
+
+    def get_selected_config(self) -> str:
+        """Return the currently selected config file path."""
+        with self.lock:
+            if self.available_configs and 0 <= self.selected_config_index < len(self.available_configs):
+                return self.available_configs[self.selected_config_index]
+            return "config.ini"
 
     def add_message(self, text: str, timeout_seconds: int = 10) -> None:
         """Add an event/alert message with a countdown period to the dashboard (idea.txt)."""
@@ -2092,6 +2167,14 @@ class StatusDashboard:
         divider = "=" * (len(header) + 12)
 
         lines = ["", divider, header, divider]
+
+        if self.available_configs:
+            lines.append("CONFIG FILE SELECTION:")
+            for idx, cfg in enumerate(self.available_configs):
+                marker = "► [SELECTED]" if idx == self.selected_config_index else " "
+                lines.append(f"  [{idx + 1}] {cfg:<30} {marker}")
+            lines.append("-" * (len(header) + 12))
+
         lines.append(
             f"{'NODE IP':<16} {'DEVICE':<10} {'CONNECTED':<11} {'PART FILE':<12} {'STATE':<20} {'FLAGS [R/E/S]':<14} {'PROGRESS / RUN TIME'}"
         )
