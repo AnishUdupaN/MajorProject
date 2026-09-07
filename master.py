@@ -428,13 +428,13 @@ def handle_no_spare_nodes_recovery(
     master_ip_address: str | None = None,
     dashboard: StatusDashboard | None = None,
 ) -> tuple[str, socket.socket, FileTransferDaemon]:
-    """When no spare nodes are available, ask user to (k)ill task, (w)ait 1 minute for new nodes, or (r)eassign to a healthy node when finished."""
+    """When no spare nodes are available, ask user to (k)ill task, (w)ait 1 minute for new nodes, (r)eassign to a healthy node when finished, or (b)oth (listen for new nodes & fallback)."""
     printlog(f"\n[RECOVERY ALERT] Node {failed_ip} failed and no spare nodes are available for recovery.")
 
     while True:
         if dashboard:
             dashboard.add_message(
-                f"ALERT: Node {failed_ip} failed! No spare nodes. Press 'k' to kill, 'w' to wait 1m, 'r' to reassign when a node finishes.",
+                f"ALERT: Node {failed_ip} failed! No spare nodes. Press 'k' to kill, 'w' to wait 1m, 'r' to reassign, 'b' for both.",
                 timeout_seconds=60,
             )
 
@@ -446,7 +446,8 @@ def handle_no_spare_nodes_recovery(
         print("  [k] Kill task: Safely terminate running tasks on healthy nodes and exit.")
         print("  [w] Wait 1 minute: Keep healthy nodes running and wait for a new node to connect.")
         print("  [r] Reassign when finished: Wait until a healthy node finishes its task and reassign this task to it.")
-        sys.stdout.write("Enter choice (k/w/r): ")
+        print("  [b] Both: Listen for new nodes for 60s; if none found, fallback to reassigning to first finished node.")
+        sys.stdout.write("Enter choice (k/w/r/b): ")
         sys.stdout.flush()
 
         choice = ""
@@ -469,7 +470,7 @@ def handle_no_spare_nodes_recovery(
                     rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
                     if rlist:
                         char = sys.stdin.read(1).lower()
-                        if char in ("k", "w", "r"):
+                        if char in ("k", "w", "r", "b"):
                             choice = char
                             print(char)
                             break
@@ -483,6 +484,8 @@ def handle_no_spare_nodes_recovery(
                                 choice = "w"
                             elif line.startswith("r"):
                                 choice = "r"
+                            elif line.startswith("b"):
+                                choice = "b"
                             break
                     except Exception:
                         choice = "k"
@@ -514,7 +517,7 @@ def handle_no_spare_nodes_recovery(
 
                 with worker_pool.lock:
                     for ip in list(worker_pool.connections.keys()):
-                        if ip not in active_tasks and ip != failed_ip:
+                        if ip not in active_tasks:
                             found_spare_ip = ip
                             break
 
@@ -674,6 +677,160 @@ def handle_no_spare_nodes_recovery(
                 )
                 return reassigned_ip, reassigned_conn, daemon
 
+        elif choice == "b":
+            print("\nUser selected BOTH. Listening up to 60s for new nodes or waiting for healthy node to finish...")
+            printlog(f"\nUser selected 'b' (both) after failure of node {failed_ip}.")
+
+            wait_start = time.time()
+            wait_timeout = 60.0
+            found_spare_ip = None
+            reassigned_ip = None
+
+            while time.time() - wait_start < wait_timeout:
+                elapsed_wait = int(time.time() - wait_start)
+                remaining = int(wait_timeout - elapsed_wait)
+
+                with worker_pool.lock:
+                    for ip in list(worker_pool.connections.keys()):
+                        if ip not in active_tasks:
+                            found_spare_ip = ip
+                            break
+
+                if found_spare_ip:
+                    print(f"\n[NEW NODE CONNECTED] Discovered new node {found_spare_ip}!")
+                    printlog(f"[FAILOVER] New node {found_spare_ip} connected during both-wait period.")
+                    break
+
+                healthy_candidates = [ip for ip in active_tasks if ip != failed_ip]
+                for healthy_ip in healthy_candidates:
+                    t = active_tasks[healthy_ip]
+                    if t.get("exec_finished"):
+                        reassigned_ip = healthy_ip
+                        break
+
+                if reassigned_ip:
+                    print(f"\n[HEALTHY NODE FINISHED] Healthy node {reassigned_ip} finished its task!")
+                    printlog(f"[FAILOVER] Healthy node {reassigned_ip} finished during both-wait period.")
+                    break
+
+                if dashboard:
+                    dashboard.add_message(
+                        f"Listening for new nodes or healthy node completion ({remaining}s remaining)... Press 'k' to kill.",
+                        timeout_seconds=2,
+                    )
+
+                if sys.stdin.isatty():
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+                    if rlist:
+                        char = sys.stdin.read(1).lower()
+                        if char == "k":
+                            print("\nUser pressed 'k' during wait. Shutting down task...")
+                            raise RuntimeError("Task execution killed by user during node wait period.")
+
+                socket_map = {
+                    t["connection"]: a_ip
+                    for a_ip, t in active_tasks.items()
+                    if a_ip != failed_ip and not t.get("exec_finished")
+                }
+                if socket_map:
+                    readable, _, _ = select.select(list(socket_map.keys()), [], [], 0.5)
+                    for sock in readable:
+                        a_ip = socket_map[sock]
+                        t = active_tasks[a_ip]
+                        try:
+                            msg = receive_json_message(sock)
+                            if msg.get("type") == "finished":
+                                t["exec_finished"] = True
+                                exec_time = msg.get("execution_time", 0.0)
+                                printlog(f"[EXECUTION COMPLETE] Node {a_ip} finished {t['part_filename']} in {exec_time:.2f}s")
+                                if dashboard:
+                                    dashboard.update_node(
+                                        a_ip, f"node{t['node_index']}", t["part_filename"], PROGRESS_RECEIVING_FILES,
+                                        receiving=True, executing=False, sending=False
+                                    )
+                        except Exception:
+                            pass
+
+                time.sleep(0.2)
+
+            if not found_spare_ip and not reassigned_ip:
+                print("\n[TIMEOUT] 60s elapsed with no new nodes. Falling back to waiting for healthy node to finish...")
+                printlog("[RECOVERY FALLBACK] Falling back to waiting for healthy node to finish.")
+
+                while True:
+                    healthy_candidates = [ip for ip in active_tasks if ip != failed_ip]
+                    if not healthy_candidates:
+                        print("\n[ERROR] No healthy running nodes available to take over the task.")
+                        break
+
+                    for healthy_ip in healthy_candidates:
+                        t = active_tasks[healthy_ip]
+                        if t.get("exec_finished"):
+                            reassigned_ip = healthy_ip
+                            break
+
+                    if reassigned_ip:
+                        break
+
+                    if dashboard:
+                        dashboard.add_message(
+                            f"Fallback: Waiting for healthy node to finish {part_filename}... Press 'k' to kill.",
+                            timeout_seconds=2,
+                        )
+
+                    if sys.stdin.isatty():
+                        rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+                        if rlist:
+                            char = sys.stdin.read(1).lower()
+                            if char == "k":
+                                print("\nUser pressed 'k' during wait. Shutting down task...")
+                                raise RuntimeError("Task execution killed by user during node wait period.")
+
+                    socket_map = {
+                        t["connection"]: a_ip
+                        for a_ip, t in active_tasks.items()
+                        if a_ip != failed_ip and not t.get("exec_finished")
+                    }
+                    if socket_map:
+                        readable, _, _ = select.select(list(socket_map.keys()), [], [], 0.5)
+                        for sock in readable:
+                            a_ip = socket_map[sock]
+                            t = active_tasks[a_ip]
+                            try:
+                                msg = receive_json_message(sock)
+                                if msg.get("type") == "finished":
+                                    t["exec_finished"] = True
+                            except Exception:
+                                pass
+
+                    time.sleep(0.2)
+
+            if found_spare_ip:
+                updated_mapping = swap_device_ip(failed_ip, found_spare_ip)
+                printlog(f"[FAILOVER] Updated devices.json: {updated_mapping}")
+                spare_connection = worker_pool.get_connection(found_spare_ip)
+                daemon = distribute_part_file_to_single_node(
+                    found_spare_ip, part_filename, spare_connection, parts_directory, master_ip_address
+                )
+                return found_spare_ip, spare_connection, daemon
+            elif reassigned_ip:
+                print(f"\n[TASK REASSIGNMENT] Node {reassigned_ip} finished its task and is taking over {part_filename}!")
+                printlog(f"[REASSIGNMENT] Reassigning {part_filename} (node{node_index}) to healthy node {reassigned_ip}.")
+                try:
+                    updated_mapping = swap_device_ip(failed_ip, reassigned_ip)
+                except Exception:
+                    pass
+                reassigned_conn = worker_pool.get_connection(reassigned_ip)
+                if dashboard:
+                    dashboard.update_node(
+                        reassigned_ip, f"node{node_index}", part_filename, "reassigned",
+                        receiving=False, executing=False, sending=False, connected=True
+                    )
+                daemon = distribute_part_file_to_single_node(
+                    reassigned_ip, part_filename, reassigned_conn, parts_directory, master_ip_address
+                )
+                return reassigned_ip, reassigned_conn, daemon
+
 
 def reassign_task_to_spare_node(
     failed_ip: str,
@@ -692,7 +849,7 @@ def reassign_task_to_spare_node(
     elif active_tasks is not None:
         with worker_pool.lock:
             for ip in list(worker_pool.connections.keys()):
-                if ip not in active_tasks and ip != failed_ip:
+                if ip not in active_tasks:
                     spare_ip = ip
                     break
 
@@ -910,7 +1067,8 @@ def monitor_worker_executions_and_collect_results(
                     )
                     if dashboard:
                         dashboard.update_node(
-                            ip, f"node{task['node_index']}", task["part_filename"], PROGRESS_FINISHED
+                            ip, f"node{task['node_index']}", task["part_filename"], PROGRESS_FINISHED,
+                            receiving=False, executing=False, sending=False, connected=True
                         )
 
         time.sleep(0.5)
