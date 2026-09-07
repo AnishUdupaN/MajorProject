@@ -23,6 +23,7 @@ from core import (
     compute_md5,
     discover_master_ip,
     get_worker_platform,
+    get_available_configs,
     load_config,
     receive_binary_info_request,
     receive_binary_ready,
@@ -48,8 +49,8 @@ def parse_worker_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default="config.ini",
-        help="Path to the config file (default: config.ini)",
+        default=None,
+        help="Path to the config file (default: auto-discovered from config/ directory)",
     )
     parser.add_argument(
         "--download-directory",
@@ -276,11 +277,21 @@ def run_worker() -> None:
     arguments = parse_worker_arguments()
     master_ip_address = arguments.master_ip_address
 
+    config_path = arguments.config
+    if config_path is None:
+        available = get_available_configs()
+        if not available:
+            print("Error: No .ini configuration files found.", file=sys.stderr)
+            sys.exit(1)
+        config_path = available[0]
+
     try:
-        config = load_config(arguments.config)
+        config = load_config(config_path)
     except ValueError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    print(f"Loaded config from {config_path}")
 
     shared_secret = get_shared_secret()
 

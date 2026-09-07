@@ -323,16 +323,11 @@ def printlog(st):
 
 
 def get_available_configs(base_dir: str | Path = ".") -> list[str]:
-    """Discover available .ini configuration files in root and config/ directory."""
+    """Discover available .ini configuration files in config/ directory and root."""
     base_path = Path(base_dir).resolve()
     configs = []
 
-    # Check root config.ini
-    root_ini = base_path / "config.ini"
-    if root_ini.is_file():
-        configs.append("config.ini")
-
-    # Check config/ directory
+    # Check config/ directory first
     config_dir = base_path / "config"
     if config_dir.is_dir():
         for file in sorted(config_dir.glob("*.ini")):
@@ -343,6 +338,11 @@ def get_available_configs(base_dir: str | Path = ".") -> list[str]:
             if rel_path not in configs:
                 configs.append(rel_path)
 
+    # Check root config.ini if it exists
+    root_ini = base_path / "config.ini"
+    if root_ini.is_file() and "config.ini" not in configs:
+        configs.append("config.ini")
+
     # Check any other root *.ini files
     for file in sorted(base_path.glob("*.ini")):
         try:
@@ -352,10 +352,8 @@ def get_available_configs(base_dir: str | Path = ".") -> list[str]:
         if rel_path not in configs:
             configs.append(rel_path)
 
-    if not configs:
-        configs.append("config.ini")
-
     return configs
+
 
 
 def load_config(config_path: str) -> Config:
@@ -451,6 +449,11 @@ def swap_device_ip(
         raise FileNotFoundError(f"{devices_json_path} does not exist")
 
     mapping: dict[str, str] = json.loads(path.read_text())
+    if old_ip not in mapping:
+        for k in list(mapping.keys()):
+            if k == old_ip or k.split(":")[0] == old_ip.split(":")[0]:
+                old_ip = k
+                break
     if old_ip not in mapping:
         raise KeyError(f"IP address {old_ip} not found in {devices_json_path}")
 
@@ -718,9 +721,10 @@ def discover_master_ip(timeout_seconds: float = 60.0) -> str:
 
 def get_local_ip_for_peer(peer_ip_address: str) -> str:
     """Return the local IP address used to reach a peer on the LAN."""
+    peer_ip = peer_ip_address.split(":")[0]
     connection = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        connection.connect((peer_ip_address, 9))
+        connection.connect((peer_ip, 9))
         return connection.getsockname()[0]
     finally:
         connection.close()
@@ -971,20 +975,15 @@ class FileTransferDaemon:
         wait_for_daemon_port(self._process, self.port)
 
     def stop(self) -> None:
-        """Stop this node's file-transfer daemon process."""
+        """Stop this node's file-transfer daemon process immediately."""
         _active_daemons_registry.discard(self)
         if self._process is not None and self._process.poll() is None:
             try:
-                self._process.terminate()
-                self._process.wait(timeout=2)
+                self._process.kill()
+                self._process.wait(timeout=0.2)
             except Exception:
                 pass
-            if self._process.poll() is None:
-                try:
-                    self._process.kill()
-                    self._process.wait(timeout=2)
-                except Exception:
-                    pass
+
 
 
 def _make_handler_class(
@@ -2038,7 +2037,9 @@ class StatusDashboard:
             if self.available_configs:
                 self.selected_config_index = (self.selected_config_index + 1) % len(self.available_configs)
             self._render_unlocked()
-            return self.get_selected_config()
+            if self.available_configs and 0 <= self.selected_config_index < len(self.available_configs):
+                return self.available_configs[self.selected_config_index]
+            return ""
 
     def select_config_by_index(self, index: int) -> str:
         """Select a config file by its 0-based index."""
@@ -2046,7 +2047,9 @@ class StatusDashboard:
             if self.available_configs and 0 <= index < len(self.available_configs):
                 self.selected_config_index = index
             self._render_unlocked()
-            return self.get_selected_config()
+            if self.available_configs and 0 <= self.selected_config_index < len(self.available_configs):
+                return self.available_configs[self.selected_config_index]
+            return ""
 
     def get_selected_config(self) -> str:
         """Return the currently selected config file path."""
@@ -2161,7 +2164,9 @@ class StatusDashboard:
                 updated_messages.append(msg)
         self.messages = updated_messages
 
-        os.system("clear")
+        # Clear screen using ANSI escape codes (avoids resetting terminal cbreak mode)
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
         """Render formatted CLI dashboard view."""
         header = f"=== MASTER DASHBOARD: [{self.master_state.upper()}] ==="
         divider = "=" * (len(header) + 12)
@@ -2175,38 +2180,40 @@ class StatusDashboard:
                 lines.append(f"  [{idx + 1}] {cfg:<30} {marker}")
             lines.append("-" * (len(header) + 12))
 
-        lines.append(
-            f"{'NODE IP':<16} {'DEVICE':<10} {'CONNECTED':<11} {'PART FILE':<12} {'STATE':<20} {'FLAGS [R/E/S]':<14} {'PROGRESS / RUN TIME'}"
-        )
-        lines.append("-" * (len(header) + 12))
+        if self.master_state != "config selection":
+            lines.append(
+                f"{'NODE IP':<16} {'DEVICE':<10} {'CONNECTED':<11} {'PART FILE':<12} {'STATE':<20} {'FLAGS [R/E/S]':<14} {'PROGRESS / RUN TIME'}"
+            )
+            lines.append("-" * (len(header) + 12))
 
-        if not self.node_states:
-            lines.append("  (Waiting for worker connections...)")
-        else:
-            for ip, info in self.node_states.items():
-                state_str = info["state"]
-                elapsed = info["elapsed"]
-                pct = info["pct"]
-                eta = info["eta"]
-                conn_str = "YES" if info.get("connected", True) else "NO"
-                rcv = "R" if info.get("receiving") else "-"
-                exc = "E" if info.get("executing") else "-"
-                snd = "S" if info.get("sending") else "-"
-                flags_str = f"[{rcv}/{exc}/{snd}]"
+            if not self.node_states:
+                lines.append("  (Waiting for worker connections...)")
+            else:
+                for ip, info in self.node_states.items():
+                    state_str = info["state"]
+                    elapsed = info["elapsed"]
+                    pct = info["pct"]
+                    eta = info["eta"]
+                    conn_str = "YES" if info.get("connected", True) else "NO"
+                    rcv = "R" if info.get("receiving") else "-"
+                    exc = "E" if info.get("executing") else "-"
+                    snd = "S" if info.get("sending") else "-"
+                    flags_str = f"[{rcv}/{exc}/{snd}]"
 
-                prog_parts = []
-                if elapsed is not None:
-                    m, s = int(elapsed) // 60, int(elapsed) % 60
-                    prog_parts.append(f"{m:02d}:{s:02d}")
-                if pct is not None:
-                    prog_parts.append(f"{pct:.1f}%")
-                if eta is not None:
-                    prog_parts.append(f"[ETA: {eta}]")
+                    prog_parts = []
+                    if elapsed is not None:
+                        m, s = int(elapsed) // 60, int(elapsed) % 60
+                        prog_parts.append(f"{m:02d}:{s:02d}")
+                    if pct is not None:
+                        prog_parts.append(f"{pct:.1f}%")
+                    if eta is not None:
+                        prog_parts.append(f"[ETA: {eta}]")
 
-                prog_str = " ".join(prog_parts)
-                lines.append(
-                    f"{ip:<16} {info['node_id']:<10} {conn_str:<11} {info['filename']:<12} {state_str:<20} {flags_str:<14} {prog_str}"
-                )
+                    prog_str = " ".join(prog_parts)
+                    lines.append(
+                        f"{ip:<16} {info['node_id']:<10} {conn_str:<11} {info['filename']:<12} {state_str:<20} {flags_str:<14} {prog_str}"
+                    )
+
 
         if self.messages:
             lines.append(divider)

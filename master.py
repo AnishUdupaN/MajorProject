@@ -7,6 +7,7 @@ import socket
 import sys
 import threading
 import time
+import os
 from pathlib import Path
 
 from core import (
@@ -77,26 +78,31 @@ class WorkerConnectionPool:
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
 
-    def mark_killed(self, ip: str) -> None:
-        """Mark a worker IP as permanently killed after failover so reconnects are rejected."""
+    def mark_killed(self, key: str) -> None:
+        """Mark a worker key/IP as permanently killed after failover so reconnects are rejected."""
         with self.lock:
+            ip = key.split(":")[0]
+            self.killed_ips.add(key)
             self.killed_ips.add(ip)
-            conn = self.connections.pop(ip, None)
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            if self.dashboard:
-                existing = self.dashboard.node_states.get(ip, {})
-                node_id = existing.get("node_id", "worker")
-                if "(killed)" not in node_id:
-                    node_id = f"{node_id} (killed)"
-                filename = existing.get("filename", "-")
-                self.dashboard.update_node(
-                    ip, node_id, filename, "killed",
-                    receiving=False, executing=False, sending=False, connected=False
-                )
+
+            keys_to_remove = [k for k in list(self.connections.keys()) if k == key or k == ip or k.startswith(f"{ip}:")]
+            for k in keys_to_remove:
+                conn = self.connections.pop(k, None)
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                if self.dashboard:
+                    existing = self.dashboard.node_states.get(k, {})
+                    node_id = existing.get("node_id", "worker")
+                    if "(killed)" not in node_id:
+                        node_id = f"{node_id} (killed)"
+                    filename = existing.get("filename", "-")
+                    self.dashboard.update_node(
+                        k, node_id, filename, "killed",
+                        receiving=False, executing=False, sending=False, connected=False
+                    )
 
     def _accept_loop(self) -> None:
         while self.running:
@@ -106,40 +112,89 @@ class WorkerConnectionPool:
                     continue
                 conn, addr = self.listening_socket.accept()
                 ip = addr[0]
-                if self.allowed_ips and ip not in self.allowed_ips:
+                port = addr[1]
+                endpoint = f"{ip}:{port}"
+
+                if self.allowed_ips and ip not in self.allowed_ips and endpoint not in self.allowed_ips:
                     conn.close()
                     continue
                 # VULN-07: Verify shared secret if configured
                 if self._shared_secret:
                     if not verify_auth_message(conn, self._shared_secret):
-                        printlog(f"Worker {ip}:{addr[1]} failed authentication. Rejecting.")
+                        printlog(f"Worker {endpoint} failed authentication. Rejecting.")
                         conn.close()
                         continue
+
                 with self.lock:
-                    if ip in self.killed_ips or (
+                    if ip in self.killed_ips or endpoint in self.killed_ips or (
                         self.dashboard
                         and (
                             self.dashboard.node_states.get(ip, {}).get("state") == "killed"
+                            or self.dashboard.node_states.get(endpoint, {}).get("state") == "killed"
                             or "(killed)" in self.dashboard.node_states.get(ip, {}).get("node_id", "")
+                            or "(killed)" in self.dashboard.node_states.get(endpoint, {}).get("node_id", "")
                         )
                     ):
-                        printlog(f"Worker {ip}:{addr[1]} is KILLED. Rejecting reconnect.")
+                        printlog(f"Worker {endpoint} is KILLED. Rejecting reconnect.")
                         conn.close()
                         continue
-                    old_conn = self.connections.get(ip)
-                    if old_conn is not None and old_conn != conn:
+
+                    # Check existing connections for this IP
+                    matching_keys = [k for k in list(self.connections.keys()) if k == ip or k.startswith(f"{ip}:")]
+                    dead_keys = []
+                    for k in matching_keys:
+                        old_c = self.connections[k]
                         try:
-                            rlist, _, _ = select.select([old_conn], [], [], 0.0)
+                            rlist, _, _ = select.select([old_c], [], [], 0.0)
                             if rlist:
-                                peek = old_conn.recv(1, socket.MSG_PEEK)
+                                peek = old_c.recv(1, socket.MSG_PEEK)
                                 if not peek:
-                                    old_conn.close()
+                                    dead_keys.append(k)
                         except Exception:
-                            pass
-                    self.connections[ip] = conn
-                    printlog(f"\nWorker {ip}:{addr[1]} connected, kept IDLE.")
+                            dead_keys.append(k)
+
+                    for k in dead_keys:
+                        old_c = self.connections.pop(k, None)
+                        if old_c:
+                            try:
+                                old_c.close()
+                            except Exception:
+                                pass
+                        if self.dashboard and k in self.dashboard.node_states:
+                            existing = self.dashboard.node_states.get(k, {})
+                            node_id = existing.get("node_id", "worker")
+                            filename = existing.get("filename", "-")
+                            self.dashboard.update_node(
+                                k, node_id, filename, "disconnected",
+                                receiving=False, executing=False, sending=False, connected=False
+                            )
+
+                    alive_keys = [k for k in list(self.connections.keys()) if k == ip or k.startswith(f"{ip}:")]
+                    if not alive_keys:
+                        # Single active worker for this IP -> store under key `ip`
+                        node_key = ip
+                    else:
+                        # Multiple active workers on the same IP -> promote/use endpoint keys `f"{ip}:{port}"`
+                        for k in alive_keys:
+                            if k == ip:
+                                old_c = self.connections.pop(ip)
+                                try:
+                                    old_p = old_c.getpeername()[1]
+                                    old_ep = f"{ip}:{old_p}"
+                                except Exception:
+                                    old_ep = f"{ip}:old"
+                                self.connections[old_ep] = old_c
+                                if self.dashboard and ip in self.dashboard.node_states:
+                                    st = self.dashboard.node_states.pop(ip)
+                                    self.dashboard.node_states[old_ep] = st
+
+                        node_key = endpoint
+
+                    self.connections[node_key] = conn
+                    printlog(f"\nWorker {endpoint} connected as key '{node_key}', kept IDLE.")
+
                     if self.dashboard:
-                        existing = self.dashboard.node_states.get(ip, {})
+                        existing = self.dashboard.node_states.get(node_key, {})
                         node_id = existing.get("node_id", "worker")
                         filename = existing.get("filename", "-")
                         was_connected = existing.get("connected", False) if existing else False
@@ -147,48 +202,61 @@ class WorkerConnectionPool:
                         if state in ("disconnected", "killed") or not was_connected:
                             state = "idle"
                         self.dashboard.update_node(
-                            ip, node_id, filename, state,
+                            node_key, node_id, filename, state,
                             receiving=False, executing=False, sending=False, connected=True
                         )
                         if not existing or not was_connected:
                             msg_action = "reconnected" if (existing and not was_connected) else "connected"
-                            self.dashboard.add_message(f"Node {ip} {msg_action} ({node_id})", timeout_seconds=5)
+                            self.dashboard.add_message(f"Node {node_key} {msg_action} ({node_id})", timeout_seconds=5)
             except Exception:
                 pass
 
-    def get_connection(self, ip: str, timeout_seconds: float = 30.0) -> socket.socket:
-        """Fetch connection for ip from pool, waiting if not yet connected."""
+    def get_connection(self, key: str, timeout_seconds: float = 30.0) -> socket.socket:
+        """Fetch connection for key/ip from pool, waiting if not yet connected."""
         deadline = time.time() + timeout_seconds
+        ip = key.split(":")[0]
         while time.time() < deadline:
             with self.lock:
-                conn = self.connections.get(ip)
-                if conn is not None:
-                    return conn
+                if key in self.connections:
+                    return self.connections[key]
+                # Look for matching IP or endpoint
+                for k, conn in self.connections.items():
+                    if k == ip or k.startswith(f"{ip}:") or k.split(":")[0] == ip:
+                        return conn
             time.sleep(0.2)
-        raise TimeoutError(f"Worker {ip} did not connect within {timeout_seconds}s")
+        raise TimeoutError(f"Worker {key} did not connect within {timeout_seconds}s")
 
-    def remove_connection(self, ip: str) -> None:
-        """Remove a dead or closed socket connection for ip from the pool."""
+    def remove_connection(self, key: str) -> None:
+        """Remove a dead or closed socket connection for key from the pool."""
         with self.lock:
-            conn = self.connections.pop(ip, None)
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            if self.dashboard:
-                existing = self.dashboard.node_states.get(ip, {})
-                node_id = existing.get("node_id", "worker")
-                filename = existing.get("filename", "-")
-                self.dashboard.update_node(
-                    ip, node_id, filename, "disconnected",
-                    receiving=False, executing=False, sending=False, connected=False
-                )
+            ip = key.split(":")[0]
+            target_key = key if key in self.connections else None
+            if not target_key:
+                for k in self.connections:
+                    if k == ip or k.startswith(f"{ip}:") or k.split(":")[0] == ip:
+                        target_key = k
+                        break
+
+            if target_key:
+                conn = self.connections.pop(target_key, None)
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                if self.dashboard:
+                    existing = self.dashboard.node_states.get(target_key, {})
+                    node_id = existing.get("node_id", "worker")
+                    filename = existing.get("filename", "-")
+                    self.dashboard.update_node(
+                        target_key, node_id, filename, "disconnected",
+                        receiving=False, executing=False, sending=False, connected=False
+                    )
 
     def shutdown_all_workers(self) -> None:
         """Broadcast shutdown message to all connected workers in the pool."""
         with self.lock:
-            for ip, conn in list(self.connections.items()):
+            for key, conn in list(self.connections.items()):
                 try:
                     send_shutdown_message(conn)
                 except Exception:
@@ -360,13 +428,13 @@ def handle_no_spare_nodes_recovery(
     master_ip_address: str | None = None,
     dashboard: StatusDashboard | None = None,
 ) -> tuple[str, socket.socket, FileTransferDaemon]:
-    """When no spare nodes are available, ask user to (k)ill task or (w)ait 1 minute for new nodes to connect."""
+    """When no spare nodes are available, ask user to (k)ill task, (w)ait 1 minute for new nodes, or (r)eassign to a healthy node when finished."""
     printlog(f"\n[RECOVERY ALERT] Node {failed_ip} failed and no spare nodes are available for recovery.")
 
     while True:
         if dashboard:
             dashboard.add_message(
-                f"ALERT: Node {failed_ip} failed! No spare nodes. Press 'k' to kill, 'w' to wait 1m.",
+                f"ALERT: Node {failed_ip} failed! No spare nodes. Press 'k' to kill, 'w' to wait 1m, 'r' to reassign when a node finishes.",
                 timeout_seconds=60,
             )
 
@@ -377,7 +445,8 @@ def handle_no_spare_nodes_recovery(
         print("Options:")
         print("  [k] Kill task: Safely terminate running tasks on healthy nodes and exit.")
         print("  [w] Wait 1 minute: Keep healthy nodes running and wait for a new node to connect.")
-        sys.stdout.write("Enter choice (k/w): ")
+        print("  [r] Reassign when finished: Wait until a healthy node finishes its task and reassign this task to it.")
+        sys.stdout.write("Enter choice (k/w/r): ")
         sys.stdout.flush()
 
         choice = ""
@@ -400,7 +469,7 @@ def handle_no_spare_nodes_recovery(
                     rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
                     if rlist:
                         char = sys.stdin.read(1).lower()
-                        if char in ("k", "w"):
+                        if char in ("k", "w", "r"):
                             choice = char
                             print(char)
                             break
@@ -412,6 +481,8 @@ def handle_no_spare_nodes_recovery(
                                 choice = "k"
                             elif line.startswith("w"):
                                 choice = "w"
+                            elif line.startswith("r"):
+                                choice = "r"
                             break
                     except Exception:
                         choice = "k"
@@ -492,6 +563,116 @@ def handle_no_spare_nodes_recovery(
             else:
                 print("\n[TIMEOUT] 60 seconds elapsed and no new nodes connected.")
                 printlog("[RECOVERY TIMEOUT] 60s elapsed without new nodes.")
+
+        elif choice == "r":
+            print("\nUser selected to REASSIGN. Waiting for a healthy node to complete its current task...")
+            printlog(f"\nUser selected 'r' (reassign when finished) after failure of node {failed_ip}.")
+
+            reassigned_ip = None
+            reassigned_conn = None
+
+            while True:
+                healthy_candidates = [ip for ip in active_tasks if ip != failed_ip]
+                if not healthy_candidates:
+                    print("\n[ERROR] No healthy running nodes available to take over the task.")
+                    printlog("[REASSIGN ERROR] No healthy nodes available.")
+                    break
+
+                # Check if any candidate has already finished its execution
+                for healthy_ip in healthy_candidates:
+                    t = active_tasks[healthy_ip]
+                    if t.get("exec_finished"):
+                        reassigned_ip = healthy_ip
+                        break
+
+                if reassigned_ip:
+                    break
+
+                if dashboard:
+                    dashboard.add_message(
+                        f"Waiting for a healthy node to finish so it can take over {part_filename}... Press 'k' to cancel & kill.",
+                        timeout_seconds=2,
+                    )
+
+                if sys.stdin.isatty():
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+                    if rlist:
+                        char = sys.stdin.read(1).lower()
+                        if char == "k":
+                            print("\nUser pressed 'k' during wait. Shutting down task...")
+                            raise RuntimeError("Task execution killed by user during node wait period.")
+
+                # Check control sockets for finished messages from healthy nodes
+                socket_map = {
+                    t["connection"]: a_ip
+                    for a_ip, t in active_tasks.items()
+                    if a_ip != failed_ip and not t.get("exec_finished")
+                }
+                if socket_map:
+                    readable, _, _ = select.select(list(socket_map.keys()), [], [], 0.5)
+                    for sock in readable:
+                        a_ip = socket_map[sock]
+                        t = active_tasks[a_ip]
+                        try:
+                            msg = receive_json_message(sock)
+                            if msg.get("type") == "finished":
+                                t["exec_finished"] = True
+                                exec_time = msg.get("execution_time", 0.0)
+                                printlog(
+                                    f"[EXECUTION COMPLETE] Node {a_ip} finished {t['part_filename']} in {exec_time:.2f}s"
+                                )
+                                if dashboard:
+                                    dashboard.update_node(
+                                        a_ip,
+                                        f"node{t['node_index']}",
+                                        t["part_filename"],
+                                        PROGRESS_RECEIVING_FILES,
+                                        receiving=True,
+                                        executing=False,
+                                        sending=False,
+                                    )
+                                    dashboard.add_message(
+                                        f"Node {a_ip} finished {t['part_filename']} in {exec_time:.2f}s",
+                                        timeout_seconds=10,
+                                    )
+                            elif msg.get("type") == "failed":
+                                printlog(f"[NODE FAILURE] Healthy candidate {a_ip} failed during wait.")
+                        except Exception as exc:
+                            printlog(f"[SOCKET ERROR] Node {a_ip} error during wait: {exc}")
+
+                time.sleep(0.2)
+
+            if reassigned_ip:
+                print(f"\n[TASK REASSIGNMENT] Node {reassigned_ip} finished its task and is taking over {part_filename}!")
+                printlog(f"[REASSIGNMENT] Reassigning {part_filename} (node{node_index}) to healthy node {reassigned_ip}.")
+
+                try:
+                    updated_mapping = swap_device_ip(failed_ip, reassigned_ip)
+                    printlog(f"[FAILOVER] Updated devices.json: {updated_mapping}")
+                except Exception:
+                    pass
+
+                reassigned_conn = worker_pool.get_connection(reassigned_ip)
+                if dashboard:
+                    dashboard.update_node(
+                        reassigned_ip,
+                        f"node{node_index}",
+                        part_filename,
+                        "reassigned",
+                        receiving=False,
+                        executing=False,
+                        sending=False,
+                        connected=True,
+                    )
+
+                daemon = distribute_part_file_to_single_node(
+                    reassigned_ip,
+                    part_filename,
+                    reassigned_conn,
+                    parts_directory,
+                    master_ip_address,
+                )
+                return reassigned_ip, reassigned_conn, daemon
 
 
 def reassign_task_to_spare_node(
@@ -656,7 +837,7 @@ def monitor_worker_executions_and_collect_results(
                     part_filename = task["part_filename"]
                     del active_tasks[ip]
                     if dashboard:
-                        dashboard.update_node(ip, f"node{node_index}", "-", "idle", receiving=False, executing=False, sending=False)
+                        dashboard.update_node(ip, f"node{node_index}", "-", "failed", receiving=False, executing=False, sending=False, connected=False)
                         dashboard.add_message(f"ALERT: Node {ip} task failed ({exc})", timeout_seconds=12)
 
                     retries = node_retries.get(ip, 0)
@@ -898,32 +1079,97 @@ def run_master() -> None:
 
     # Discover available config files and determine initial selection
     available_configs = get_available_configs()
+    if not available_configs:
+        print("Error: No .ini configuration files found.", file=sys.stderr)
+        sys.exit(1)
+
     if arguments.config:
         try:
             initial_config = str(Path(arguments.config).resolve().relative_to(Path(".").resolve()))
         except ValueError:
             initial_config = arguments.config
     else:
-        initial_config = "config.ini" if "config.ini" in available_configs else available_configs[0]
+        initial_config = available_configs[0]
 
     if initial_config not in available_configs:
         available_configs.insert(0, initial_config)
+
 
     # master/input holds split parts; master/output holds merged results.
     Path(arguments.parts_directory).mkdir(parents=True, exist_ok=True)
     Path(MASTER_OUTPUT_DIRECTORY).mkdir(parents=True, exist_ok=True)
 
-    # Start Master mDNS announcer in background
+    dashboard = StatusDashboard(master_state="config selection")
+    dashboard.set_available_configs(available_configs, selected=initial_config)
+
+    # Phase 1: Config Selection Phase (Before listening to worker connections)
+    if not arguments.config:
+        fd = None
+        old_settings = None
+        if sys.stdin.isatty():
+            try:
+                import termios
+                import tty
+
+                fd = sys.stdin.fileno()
+                old_settings = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+            except Exception:
+                fd = None
+                old_settings = None
+
+        try:
+            while True:
+                sel_cfg = dashboard.get_selected_config()
+                dashboard.add_message(
+                    f"Press 'c'/'1'-'{len(available_configs)}' to change config, 'y' or Enter to confirm, 'q' to quit",
+                    timeout_seconds=2,
+                )
+
+                if fd is not None:
+                    rlist, _, _ = select.select([fd], [], [], 0.5)
+                    if rlist:
+                        char = os.read(fd, 1).decode(errors="replace").lower()
+                        if char in ("y", "\n", "\r"):
+                            break
+                        elif char == "c":
+                            new_cfg = dashboard.select_next_config()
+                            dashboard.add_message(f"Selected config: {new_cfg}", timeout_seconds=3)
+                        elif char.isdigit() and 1 <= int(char) <= len(available_configs):
+                            new_cfg = dashboard.select_config_by_index(int(char) - 1)
+                            dashboard.add_message(f"Selected config: {new_cfg}", timeout_seconds=3)
+                        elif char == "q":
+                            print("\nUser pressed 'q'. Exiting selection...")
+                            sys.exit(0)
+                else:
+                    break
+                time.sleep(0.5)
+        finally:
+            if fd is not None and old_settings is not None:
+                try:
+                    import termios
+
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except Exception:
+                    pass
+
+    # Load selected config after confirmation
+    selected_config_path = dashboard.get_selected_config()
+    try:
+        config = load_config(selected_config_path)
+    except ValueError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Loaded config from {selected_config_path}")
+
+    # Phase 2: Start Network Listener, mDNS Announcer & Worker Pool
     mdns_announcer = MdnsAnnouncer(
         fqdn=MDNS_MASTER_FQDN, service=MDNS_SERVICE_MASTER
     )
     mdns_announcer.start()
 
-    dashboard = StatusDashboard(master_state="device & config selection")
-    dashboard.set_available_configs(available_configs, selected=initial_config)
-
     print(f"Listening on control port {CONTROL_PORT}...")
-
     daemons: list[FileTransferDaemon] = []
     listening_socket = open_listening_socket(FIXED_PORT)
     worker_pool = WorkerConnectionPool(
@@ -962,8 +1208,8 @@ def run_master() -> None:
         pass
 
     if not arguments.worker_ip_addresses:
-        # Device & Config Selection Phase on Dashboard (mDNS Discovery)
-        dashboard.set_master_state("device & config selection")
+        # Device Discovery Phase on Dashboard
+        dashboard.set_master_state("device discovery")
         start_time = time.time()
         timeout_seconds = 60.0
         deadline = start_time + timeout_seconds
@@ -983,51 +1229,43 @@ def run_master() -> None:
                 old_settings = None
 
         try:
-            print("Device & Config Selection active. Press 'c' to cycle config, '1'-'9' to select config, 'y' to continue, 'q' to quit...")
             while True:
                 now = time.time()
                 remaining = int(max(0.0, deadline - now))
                 with worker_pool.lock:
                     connected_ips = list(worker_pool.connections.keys())
 
-                sel_cfg = dashboard.get_selected_config()
                 dashboard.add_message(
-                    f"Discovered {len(connected_ips)} worker(s). Config: '{sel_cfg}'. Press 'c'/'1'-'{len(available_configs)}' to change config, 'y' to continue, 'q' to quit ({remaining}s remaining)",
+                    f"Discovered {len(connected_ips)} worker(s). Config: '{selected_config_path}'. Press 'y' to continue, 'q' to quit ({remaining}s remaining)",
                     timeout_seconds=2,
                 )
 
                 if fd is not None:
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
+                    rlist, _, _ = select.select([fd], [], [], 0.5)
                     if rlist:
-                        char = sys.stdin.read(1).lower()
-                        if char == "y":
-                            if not connected_ips:
-                                dashboard.add_message("Cannot start: 0 workers discovered yet! Waiting...", timeout_seconds=5)
+                        char = os.read(fd, 1).decode(errors="replace").lower()
+                        if char in ("y", "\n", "\r"):
+                            if len(connected_ips) < config.min_devices:
+                                dashboard.add_message(f"Need at least {config.min_devices} workers (discovered {len(connected_ips)} so far). Waiting...", timeout_seconds=5)
                             else:
                                 break
-                        elif char == "c":
-                            new_cfg = dashboard.select_next_config()
-                            dashboard.add_message(f"Selected config: {new_cfg}", timeout_seconds=3)
-                        elif char.isdigit() and 1 <= int(char) <= len(available_configs):
-                            new_cfg = dashboard.select_config_by_index(int(char) - 1)
-                            dashboard.add_message(f"Selected config: {new_cfg}", timeout_seconds=3)
                         elif char == "q":
                             print("\nUser pressed 'q'. Exiting selection...")
                             sys.exit(0)
                 else:
-                    if connected_ips:
+                    if len(connected_ips) >= config.min_devices:
                         break
 
                 if now >= deadline:
-                    if not connected_ips:
+                    if len(connected_ips) < config.min_devices:
                         print(
-                            f"\n[DISCOVERY TIMEOUT] No workers discovered within {int(timeout_seconds)}s. Exiting safely.",
+                            f"\n[DISCOVERY TIMEOUT] Fewer than {config.min_devices} workers discovered within {int(timeout_seconds)}s. Exiting safely.",
                             file=sys.stderr,
                         )
                         sys.exit(0)
                     else:
                         print(
-                            f"\n[SELECTION TIMEOUT] Timeout reached ({int(timeout_seconds)}s). Proceeding with selected config '{sel_cfg}'."
+                            f"\n[SELECTION TIMEOUT] Timeout reached ({int(timeout_seconds)}s). Proceeding with {len(connected_ips)} workers."
                         )
                         break
                 time.sleep(0.5)
@@ -1039,16 +1277,6 @@ def run_master() -> None:
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                 except Exception:
                     pass
-
-    # Load selected config after device selection phase
-    selected_config_path = dashboard.get_selected_config()
-    try:
-        config = load_config(selected_config_path)
-    except ValueError as exc:
-        print(f"Config error: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Loaded config from {selected_config_path}")
 
     with worker_pool.lock:
         connected_ips = list(worker_pool.connections.keys())
