@@ -497,17 +497,23 @@ def handle_no_spare_nodes_recovery(
                 timeout_seconds=60,
             )
 
-        print(f"\n==================================================================")
-        print(f"  NO RECOVERY NODES AVAILABLE FOR NODE{node_index} ({failed_ip})  ")
-        print(f"==================================================================")
-        print("One of the active devices has failed and no spare nodes are connected.")
-        print("Options:")
-        print("  [k] Kill task: Safely terminate running tasks on healthy nodes and exit.")
-        print("  [w] Wait 1 minute: Keep healthy nodes running and wait for a new node to connect.")
-        print("  [r] Reassign when finished: Wait until a healthy node finishes its task and reassign this task to it.")
-        print("  [b] Both: Listen for new nodes for 60s; if none found, fallback to reassigning to first finished node.")
-        sys.stdout.write("Enter choice (k/w/r/b): ")
-        sys.stdout.flush()
+        prompt_text = (
+            f"\n==================================================================\n"
+            f"  NO RECOVERY NODES AVAILABLE FOR NODE{node_index} ({failed_ip})  \n"
+            f"==================================================================\n"
+            "One of the active devices has failed and no spare nodes are connected.\n"
+            "Options:\n"
+            "  [k] Kill task: Safely terminate running tasks on healthy nodes and exit.\n"
+            "  [w] Wait 1 minute: Keep healthy nodes running and wait for a new node to connect.\n"
+            "  [r] Reassign when finished: Wait until a healthy node finishes its task and reassign this task to it.\n"
+            "  [b] Both: Listen for new nodes for 60s; if none found, fallback to reassigning to first finished node.\n"
+            "Enter choice (k/w/r/b): "
+        )
+        if dashboard:
+            dashboard.set_prompt(prompt_text)
+        else:
+            sys.stdout.write(prompt_text)
+            sys.stdout.flush()
 
         choice = ""
         fd = None
@@ -557,6 +563,9 @@ def handle_no_spare_nodes_recovery(
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                 except Exception:
                     pass
+                    
+        if dashboard:
+            dashboard.set_prompt(None)
 
         if choice == "k":
             print("\nUser selected to KILL the task. Shutting down all healthy worker nodes...")
@@ -1251,11 +1260,17 @@ def check_and_distribute_binaries(
 
             # Worker is missing the binary or has a stale version — prompt user
             reason = "stale/different version" if worker_has else "not present"
-            print(f"\n[BINARY] Worker {worker_ip} ({os_folder}/{arch_folder}): "
-                  f"'{config.binary_name}' {reason}.")
-            print(f"  Binary to send: {master_binary_path} ({master_binary_path.stat().st_size // 1024} KB)")
-            sys.stdout.write(f"  Send binary to {worker_ip}? [y/n]: ")
-            sys.stdout.flush()
+            prompt_text = (
+                f"\n[BINARY] Worker {worker_ip} ({os_folder}/{arch_folder}): "
+                f"'{config.binary_name}' {reason}.\n"
+                f"  Binary to send: {master_binary_path} ({master_binary_path.stat().st_size // 1024} KB)\n"
+                f"  Send binary to {worker_ip}? [y/n]: "
+            )
+            if dashboard:
+                dashboard.set_prompt(prompt_text)
+            else:
+                sys.stdout.write(prompt_text)
+                sys.stdout.flush()
 
             # Read single-char answer (works in both tty and pipe)
             user_choice = ""
@@ -1274,6 +1289,9 @@ def check_and_distribute_binaries(
                     user_choice = sys.stdin.readline().strip().lower()[:1]
             else:
                 user_choice = sys.stdin.readline().strip().lower()[:1]
+                
+            if dashboard:
+                dashboard.set_prompt(None)
 
             if user_choice != "y":
                 printlog(f"[BINARY] User declined to send binary to {worker_ip}. Worker kept idle.")
@@ -1416,7 +1434,7 @@ def run_master() -> None:
                 try:
                     while True:
                         new_cfg = dashboard.get_selected_config()
-                        dashboard.add_message(f"Select config: {new_cfg}. Press 'y' to confirm, 'q' to quit.", timeout_seconds=2)
+                        dashboard.set_prompt(f"Select config: {new_cfg}.\nUse 'w'/'s' to navigate. Press 'y' to confirm, 'q' to quit: ")
 
                         if fd is not None:
                             rlist, _, _ = select.select([fd], [], [], 0.5)
@@ -1427,6 +1445,7 @@ def run_master() -> None:
                                 elif char == "s":
                                     dashboard.move_config_selection(1)
                                 elif char in ("y", "\n", "\r"):
+                                    dashboard.set_prompt(None)
                                     dashboard.add_message(f"Selected config: {new_cfg}", timeout_seconds=3)
                                     break
                                 elif char == "q":
@@ -1436,6 +1455,7 @@ def run_master() -> None:
                             break
                         time.sleep(0.5)
                 finally:
+                    dashboard.set_prompt(None)
                     if fd is not None and old_settings is not None:
                         try:
                             import termios
@@ -1479,9 +1499,8 @@ def run_master() -> None:
                         with worker_pool.lock:
                             connected_ips = list(worker_pool.connections.keys())
 
-                        dashboard.add_message(
-                            f"Discovered {len(connected_ips)} worker(s). Config: '{selected_config_path}'. Press 'y' to continue, 'q' to quit ({remaining}s remaining)",
-                            timeout_seconds=2,
+                        dashboard.set_prompt(
+                            f"Discovered {len(connected_ips)} worker(s). Config: '{selected_config_path}'.\nPress 'y' to continue, 'q' to quit ({remaining}s remaining): "
                         )
 
                         if fd is not None:
@@ -1509,6 +1528,7 @@ def run_master() -> None:
                                 break
                         time.sleep(0.5)
                 finally:
+                    dashboard.set_prompt(None)
                     if fd is not None and old_settings is not None:
                         try:
                             import termios

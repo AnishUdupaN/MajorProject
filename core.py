@@ -2191,6 +2191,8 @@ class StatusDashboard:
         self._last_render_time = time.time()
         self.available_configs: list[str] = []
         self.selected_config_index: int = 0
+        self.task_start_time: float | None = None
+        self.active_prompt: str | None = None
 
     def set_available_configs(self, configs: list[str], selected: str | None = None) -> None:
         """Set available config paths and initial selection."""
@@ -2202,11 +2204,11 @@ class StatusDashboard:
                 self.selected_config_index = 0
             self._render_unlocked()
 
-    def select_next_config(self) -> str:
-        """Cycle to the next available config file."""
+    def move_config_selection(self, delta: int) -> str:
+        """Move the config selection by delta."""
         with self.lock:
             if self.available_configs:
-                self.selected_config_index = (self.selected_config_index + 1) % len(self.available_configs)
+                self.selected_config_index = (self.selected_config_index + delta) % len(self.available_configs)
             self._render_unlocked()
             if self.available_configs and 0 <= self.selected_config_index < len(self.available_configs):
                 return self.available_configs[self.selected_config_index]
@@ -2235,6 +2237,12 @@ class StatusDashboard:
             self.node_states.clear()
             self._render_unlocked()
 
+    def set_prompt(self, text: str | None) -> None:
+        """Set an active prompt to display at the bottom of the dashboard."""
+        with self.lock:
+            self.active_prompt = text
+            self._render_unlocked()
+
     def add_message(self, text: str, timeout_seconds: int = 10) -> None:
         """Add an event/alert message with a countdown period to the dashboard (idea.txt)."""
         with self.lock:
@@ -2244,11 +2252,16 @@ class StatusDashboard:
     def set_master_state(self, state: str) -> None:
         """Update overall master state (e.g. splitting file, merging files, finished)."""
         with self.lock:
-            self.master_state = state
             if state == PROGRESS_SPLITTING_FILE:
+                if self.task_start_time is None:
+                    self.task_start_time = time.time()
                 self.splitting_flag = True
+            elif state in ("config selection", "initializing"):
+                self.task_start_time = None
             elif state == PROGRESS_MERGING_FILES:
                 self.merging_flag = True
+                
+            self.master_state = state
             self._render_unlocked()
 
     def update_node_flags(
@@ -2349,7 +2362,13 @@ class StatusDashboard:
         sys.stdout.write("\033[2J\033[H")
         sys.stdout.flush()
         """Render formatted CLI dashboard view."""
-        header = f"=== MASTER DASHBOARD: [{self.master_state.upper()}] ==="
+        uptime_str = ""
+        if getattr(self, "task_start_time", None) is not None:
+            uptime = int(time.time() - self.task_start_time)
+            um, us = uptime // 60, uptime % 60
+            uptime_str = f" [UPTIME: {um:02d}:{us:02d}]"
+            
+        header = f"=== MASTER DASHBOARD: [{self.master_state.upper()}]{uptime_str} ==="
         divider = "=" * (len(header) + 12)
 
         lines = ["", divider, header, divider]
@@ -2408,8 +2427,18 @@ class StatusDashboard:
                 lines.append(f"  • {m['text']} ({int(m['time_left'])}s left)")
 
         lines.append(divider)
+        
+        if self.active_prompt:
+            for line in self.active_prompt.split('\n'):
+                lines.append(line)
+
         printlog("\n".join(lines) + "\n")
-        print("\n".join(lines))
+        out_str = "\n".join(lines)
+        if self.active_prompt and not self.active_prompt.endswith("\n"):
+            sys.stdout.write(out_str)
+            sys.stdout.flush()
+        else:
+            print(out_str)
 
 
 
@@ -2439,6 +2468,38 @@ def benchmark_multi_core(duration_seconds: float = 1.0) -> float:
     except Exception:
         single = benchmark_single_core(duration_seconds)
         return single * num_cores
+
+def detect_cpu_name() -> str:
+    cpu_name = "Unknown CPU"
+    system = platform.system()
+    if system == "Darwin":
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                cpu_name = result.stdout.strip()
+        except Exception:
+            pass
+    elif system == "Linux":
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        cpu_name = line.split(":", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+    else:
+        try:
+            import platform as plat
+            cpu = plat.processor()
+            if cpu:
+                cpu_name = cpu
+        except Exception:
+            pass
+    return cpu_name
 
 def detect_gpu_info() -> dict:
     info = {"gpu_name": "", "vram_mb": 0, "hw_encoders": []}
@@ -2551,7 +2612,9 @@ def run_node_benchmark() -> dict:
     except Exception:
         pass
         
+    cpu_name_detected = detect_cpu_name()
     result = {
+        "cpu_name": predefined_scores.get("cpu_name", cpu_name_detected) if predefined_scores else cpu_name_detected,
         "single_core_score": predefined_scores.get("single_core_score") if predefined_scores else round(benchmark_single_core(0.5), 1),
         "multi_core_score": predefined_scores.get("multi_core_score") if predefined_scores else round(benchmark_multi_core(1.0), 1),
         "gpu_name": gpu["gpu_name"],
@@ -2567,8 +2630,9 @@ def run_node_benchmark() -> dict:
         "username": username,
     }
     
+    print(f"  CPU: {result['cpu_name']} ({result['cpu_count']} cores)")
     print(f"  Single-core: {result['single_core_score']:.0f} ops/s")
-    print(f"  Multi-core:  {result['multi_core_score']:.0f} ops/s ({result['cpu_count']} cores)")
+    print(f"  Multi-core:  {result['multi_core_score']:.0f} ops/s")
     if result["gpu_name"]:
         print(f"  GPU: {result['gpu_name']} ({result['vram_mb']} MB VRAM)")
     print(f"  RAM: {result['total_ram_mb']} MB | Power: {'AC' if result['is_plugged_in'] else 'Battery'} ({result['battery_pct']}%)")

@@ -11,7 +11,7 @@ binaries
 .binaries
 blender-projects
 new-idea.txt
-
+.DS_STORE
 # Sensitive configuration and log files
 config.ini
 devices.json
