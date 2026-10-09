@@ -250,6 +250,8 @@ def send_binary_info_request(connection: socket.socket, binary_name: str) -> Non
 def receive_binary_info_request(connection: socket.socket) -> dict:
     """Worker receives the master's binary_info_request message."""
     msg = receive_json_message(connection)
+    if msg.get("type") == MESSAGE_TYPE_SHUTDOWN:
+        raise MasterShutdownError("Master sent shutdown signal")
     if msg.get("type") != MESSAGE_TYPE_BINARY_INFO_REQUEST:
         raise ValueError(f"Expected binary_info_request message, got: {msg!r}")
     return msg
@@ -290,6 +292,8 @@ def send_binary_ready(connection: socket.socket) -> None:
 def receive_binary_ready(connection: socket.socket) -> None:
     """Worker waits for the master's binary_ready signal before proceeding."""
     msg = receive_json_message(connection)
+    if msg.get("type") == MESSAGE_TYPE_SHUTDOWN:
+        raise MasterShutdownError("Master sent shutdown signal")
     if msg.get("type") != MESSAGE_TYPE_BINARY_READY:
         raise ValueError(f"Expected binary_ready message, got: {msg!r}")
 
@@ -1579,7 +1583,9 @@ def run_execute_command(
     process_env = os.environ.copy()
     try:
         os_folder, arch_folder = get_worker_platform()
-        bin_dir = str((Path(WORKER_DIRECTORY) / "binaries" / os_folder / arch_folder).resolve())
+        # Extract binary name from template (usually the first word)
+        binary_name = command_args[0] if command_args else "ffmpeg"
+        bin_dir = str(resolve_worker_binary_cache_path(os_folder, arch_folder, binary_name).parent.resolve())
         process_env["PATH"] = f"{bin_dir}{os.pathsep}{process_env.get('PATH', '')}"
     except Exception:
         pass
