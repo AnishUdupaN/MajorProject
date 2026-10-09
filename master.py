@@ -356,6 +356,11 @@ def parse_master_arguments() -> argparse.Namespace:
         default=None,
         help="Optional IP addresses of worker nodes. If omitted, auto-discovers workers via mDNS.",
     )
+    parser.add_argument(
+        "--webserver",
+        action="store_true",
+        help="Start a web dashboard on port 8080",
+    )
     return parser.parse_args()
 
 
@@ -1411,6 +1416,11 @@ def run_master() -> None:
 
     dashboard = StatusDashboard()
     dashboard.set_available_configs(available_configs, initial_config)
+    
+    if arguments.webserver:
+        from web_dashboard import start_web_server
+        start_web_server(dashboard)
+        print("Web dashboard started on http://0.0.0.0:8080")
 
     # Move Network Listener Initialization HERE (Outside the loop)
     mdns_announcer = MdnsAnnouncer(
@@ -1458,6 +1468,9 @@ def run_master() -> None:
 
     try:
         while True:
+            # Restore available configs (might have been hidden in previous run)
+            dashboard.set_available_configs(available_configs, initial_config)
+            
             # Phase 1: Config Selection Phase
             if not arguments.config:
                 dashboard.set_master_state("config selection")
