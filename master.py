@@ -1205,7 +1205,7 @@ def check_and_distribute_binaries(
     and return only that re-sorted list (binary_idle workers are silently moved to
     spare and remain connected but receive no tasks).
     """
-    if not config.require_binary or not config.binary_name:
+    if not config.binary_name:
         # Binary distribution disabled; all nodes are ready as-is.
         return active_nodes, []
 
@@ -1230,7 +1230,15 @@ def check_and_distribute_binaries(
             worker_has = info["has_binary"]
             worker_md5 = info.get("md5", "")
 
-            # Step 3 — locate master's binary for that platform
+            # Step 3 — decide if transfer is needed
+            if worker_has and not config.require_binary:
+                printlog(f"[BINARY] Worker {worker_ip} has {config.binary_name} locally (require_binary=false). Skipping transfer.")
+                print(f"  [BINARY] Worker {worker_ip}: {config.binary_name} present locally. ✓")
+                send_binary_ready(connection)
+                binary_ready.append(worker_ip)
+                continue
+                
+            # If we reach here, we need the master binary either to verify MD5 or to send it
             master_binary_path = get_binary_path(
                 config.binaries_directory, os_folder, arch_folder, config.binary_name
             )
@@ -1250,7 +1258,6 @@ def check_and_distribute_binaries(
 
             master_md5 = compute_md5(str(master_binary_path))
 
-            # Step 4 — decide if transfer is needed
             if worker_has and worker_md5 == master_md5:
                 printlog(f"[BINARY] Worker {worker_ip} already has {config.binary_name} (MD5 match). Skipping transfer.")
                 print(f"  [BINARY] Worker {worker_ip}: {config.binary_name} up-to-date. ✓")

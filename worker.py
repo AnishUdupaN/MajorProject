@@ -129,7 +129,7 @@ def do_binary_handshake(
 
     If require_binary is False or binary_name is empty, this function is a no-op.
     """
-    if not config.require_binary or not config.binary_name:
+    if not config.binary_name:
         return
 
     # Step 1 — receive the request
@@ -143,6 +143,12 @@ def do_binary_handshake(
     cache_path = resolve_worker_binary_cache_path(os_folder, arch_folder, binary_name)
     has_binary = cache_path.is_file()
     local_md5 = compute_md5(str(cache_path)) if has_binary else None
+
+    if not has_binary and not config.require_binary:
+        import shutil
+        if shutil.which(binary_name):
+            has_binary = True
+            local_md5 = "system"
 
     print(
         f"[BINARY] Platform: {os_folder}/{arch_folder}. "

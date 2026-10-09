@@ -1576,6 +1576,14 @@ def run_execute_command(
     print(f"{PROGRESS_EXECUTING} ({filename}) - starting: {resolved_command}")
     start_time = time.time()
 
+    process_env = os.environ.copy()
+    try:
+        os_folder, arch_folder = get_worker_platform()
+        bin_dir = str((Path(WORKER_DIRECTORY) / "binaries" / os_folder / arch_folder).resolve())
+        process_env["PATH"] = f"{bin_dir}{os.pathsep}{process_env.get('PATH', '')}"
+    except Exception:
+        pass
+
     process = subprocess.Popen(
         command_args,
         stdin=subprocess.DEVNULL,
@@ -1583,6 +1591,7 @@ def run_execute_command(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=process_env,
     )
 
     state = {
