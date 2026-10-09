@@ -1013,7 +1013,7 @@ def request_file(
     url = f"http://{master_ip_address}:{file_transfer_port}/file/{filename}"
     destination_path = Path(destination_directory) / filename
     try:
-        with urllib.request.urlopen(url, timeout=10.0) as response:
+        with urllib.request.urlopen(url, timeout=1200.0) as response:
             destination_path.write_bytes(response.read())
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"Failed to fetch {filename}: HTTP {exc.code}") from exc
@@ -1044,7 +1044,7 @@ def upload_result_file(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=10.0) as response:
+        with urllib.request.urlopen(request, timeout=1200.0) as response:
             if response.status != 200:
                 raise RuntimeError(f"Failed to upload {filename}: HTTP {response.status}")
     except urllib.error.HTTPError as exc:

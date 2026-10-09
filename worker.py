@@ -109,6 +109,20 @@ def connect_to_master(
     return connection
 
 
+def ensure_executable(path: Path) -> None:
+    import os, sys
+    if not path.is_file():
+        return
+    try:
+        if not os.access(path, os.X_OK):
+            path.chmod(0o755)
+            if not os.access(path, os.X_OK):
+                raise PermissionError(f"Failed to set executable permissions on {path}")
+    except Exception as e:
+        print(f"\n[ERROR] Failed to make binary '{path.name}' executable: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def do_binary_handshake(
     connection: socket.socket,
     master_ip_address: str,
@@ -141,6 +155,7 @@ def do_binary_handshake(
 
     # Step 3 & 4 — check local cache
     cache_path = resolve_worker_binary_cache_path(os_folder, arch_folder, binary_name)
+    ensure_executable(cache_path)
     has_binary = cache_path.is_file()
     local_md5 = compute_md5(str(cache_path)) if has_binary else None
 
@@ -191,8 +206,7 @@ def do_binary_handshake(
         
         # Make the downloaded binary executable
         if cache_path.is_file():
-            import os
-            cache_path.chmod(0o755)
+            ensure_executable(cache_path)
 
         print(f"[BINARY] Binary '{binary_name}' saved to {cache_path}. ✓")
 
@@ -249,17 +263,19 @@ def run_worker_task(
         file_transfer_port = ready_message["file_transfer_port"]
         execute_cmd = ready_message.get("execute_command", execute_command_template)
 
+        print(f"\n[STATUS] Receiving file from master...")
         downloaded_path = fetch_allocated_part_file(
             master_ip_address,
             file_transfer_port,
             download_directory,
         )
-        print(f"Downloaded part file to {downloaded_path}")
+        print(f"[STATUS] Received part file: {downloaded_path}")
 
         send_file_received_message(connection)
 
         # Phase 3 & 4: Execute task on the downloaded part file.
         # Force-stops process if connection is lost or user presses 'k'.
+        print(f"\n[STATUS] Task is running...")
         try:
             elapsed_time = run_execute_command(
                 execute_cmd,
@@ -275,14 +291,17 @@ def run_worker_task(
             except Exception:
                 pass
             raise
+            
+        print(f"[STATUS] Task complete.")
 
         part_filename = Path(downloaded_path).name
         output_filepath = Path(WORKER_OUTPUT_DIRECTORY) / part_filename
 
         # Phase 4 Task 4.1: Upload completed output file back to Master's per-node file-transfer daemon FIRST
         if output_filepath.is_file():
+            print(f"\n[STATUS] Sending result file to master...")
             upload_result_file(master_ip_address, file_transfer_port, str(output_filepath))
-            print(f"Uploaded result {part_filename} to master daemon on port {file_transfer_port}")
+            print(f"[STATUS] Sent result {part_filename} to master.")
 
         # Send finished signal to Master over control port AFTER upload completes
         send_finished_message(connection, elapsed_time, part_filename)
