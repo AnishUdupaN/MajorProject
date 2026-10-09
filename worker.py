@@ -164,6 +164,11 @@ def do_binary_handshake(
     from core import receive_json_message, MESSAGE_TYPE_READY, MESSAGE_TYPE_BINARY_READY
     msg = receive_json_message(connection)
 
+    # Master may skip handshake and send ready directly if it reused state
+    if msg.get("type") == MESSAGE_TYPE_READY:
+        print(f"[BINARY] Master skipped handshake. Proceeding directly to task.")
+        return msg
+
     if msg.get("type") == MESSAGE_TYPE_BINARY_READY:
         # Master confirmed we already have it (or decided not to send)
         print(f"[BINARY] Master acknowledged binary '{binary_name}'. Proceeding.")
@@ -183,6 +188,12 @@ def do_binary_handshake(
             if dest_path != expected and dest_path.is_file():
                 dest_path.rename(expected)
         send_file_received_message(connection)
+        
+        # Make the downloaded binary executable
+        if cache_path.is_file():
+            import os
+            cache_path.chmod(0o755)
+
         print(f"[BINARY] Binary '{binary_name}' saved to {cache_path}. ✓")
 
         # Step 7 — wait for binary_ready
@@ -224,12 +235,17 @@ def run_worker_task(
     execute_command_template: str,
     simulate_failure_after: float | None = None,
     config: Config | None = None,
+    early_ready_msg: dict | None = None,
 ) -> None:
     """Handle ready message, fetch allocated part file, run execute_command, send finished signal, and upload result."""
     downloaded_path = None
     output_filepath = None
     try:
-        ready_message = receive_ready_message(connection, timeout=600.0)
+        if early_ready_msg:
+            ready_message = early_ready_msg
+        else:
+            ready_message = receive_ready_message(connection, timeout=600.0)
+            
         file_transfer_port = ready_message["file_transfer_port"]
         execute_cmd = ready_message.get("execute_command", execute_command_template)
 
@@ -417,7 +433,7 @@ def run_worker() -> None:
                     send_worker_telemetry(connection, telemetry)
 
                     # Phase 0: Perform binary handshake
-                    do_binary_handshake(connection, master_ip_address, config)
+                    early_ready = do_binary_handshake(connection, master_ip_address, config)
                     
                     print("Connected to master. Node state: IDLE. Waiting for task assignment...")
                     reconnect_start_time = None
@@ -437,6 +453,7 @@ def run_worker() -> None:
                     config.execute_command,
                     simulate_failure_after=current_sim_fail,
                     config=config,
+                    early_ready_msg=early_ready,
                 )
                 print("Task completed. Node returning to IDLE state. Waiting for next task...")
 

@@ -409,8 +409,11 @@ def distribute_part_file_to_single_node(
 
     reachable_master_ip = master_ip_address or get_local_ip_for_peer(worker_ip_address)
     printlog(f"{PROGRESS_SENDING_FILE} ({worker_ip_address}, {part_filename})")
-    send_ready_message(connection, reachable_master_ip, daemon.port)
-    receive_file_received_message(connection)
+    try:
+        send_ready_message(connection, reachable_master_ip, daemon.port)
+        receive_file_received_message(connection)
+    except (ConnectionError, OSError) as exc:
+        printlog(f"[WARNING] Failed to receive file confirmation from {worker_ip_address}: {exc}")
     return daemon
 
 
@@ -462,14 +465,20 @@ def distribute_part_files_to_active_nodes(
             dashboard.add_message(
                 f"Sending {part_filename} to {worker_ip_address}", timeout_seconds=8
             )
-        send_ready_message(connection, reachable_master_ip, file_transfer_port)
+        try:
+            send_ready_message(connection, reachable_master_ip, file_transfer_port)
+        except (ConnectionError, OSError) as exc:
+            printlog(f"[WARNING] Failed to send ready message to {worker_ip_address}: {exc}")
 
     for worker_ip_address, part_filename, connection, _, _ in pending_transfers:
-        receive_file_received_message(connection)
-        if dashboard:
-            dashboard.update_node_flags(
-                worker_ip_address, receiving=False, executing=True, sending=False
-            )
+        try:
+            receive_file_received_message(connection)
+            if dashboard:
+                dashboard.update_node_flags(
+                    worker_ip_address, receiving=False, executing=True, sending=False
+                )
+        except (ConnectionError, OSError) as exc:
+            printlog(f"[WARNING] Failed to receive file confirmation from {worker_ip_address}: {exc}")
 
     return daemons
 
