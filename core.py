@@ -2197,7 +2197,7 @@ class StatusDashboard:
     """Live CLI status view tracking master and per-node states as specified in idea.txt."""
 
     def __init__(self, master_state: str = "initializing") -> None:
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.master_state = master_state
         self.splitting_flag = False
         self.merging_flag = False
