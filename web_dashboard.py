@@ -6,6 +6,24 @@ from core import StatusDashboard
 class DashboardHTTPRequestHandler(BaseHTTPRequestHandler):
     dashboard: StatusDashboard = None  # Class variable to be injected
 
+    def do_POST(self):
+        if self.path == "/api/input":
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+            try:
+                data = json.loads(post_data)
+                answer = data.get("answer")
+                if answer and self.dashboard:
+                    self.dashboard.submit_input(answer)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok"}).encode("utf-8"))
+            except Exception:
+                self.send_error(400, "Bad Request")
+        else:
+            self.send_error(404, "Not Found")
+
     def do_GET(self):
         if self.path == "/api/status":
             self.send_response(200)
@@ -23,6 +41,7 @@ class DashboardHTTPRequestHandler(BaseHTTPRequestHandler):
                     "messages": self.dashboard.messages[-10:],
                     "configs": self.dashboard.available_configs,
                     "selected_config": self.dashboard.get_selected_config(),
+                    "active_prompt": self.dashboard.active_prompt,
                     "uptime": uptime,
                 }
             self.wfile.write(json.dumps(data).encode("utf-8"))
@@ -46,11 +65,21 @@ class DashboardHTTPRequestHandler(BaseHTTPRequestHandler):
         .disconnected { color: #f44747; }
         .finished { color: #6a9955; }
         .executing { color: #ce9178; }
+        .prompt-box { background: #252526; border: 1px solid #569cd6; padding: 15px; margin-bottom: 20px; border-radius: 4px; }
+        .btn { background: #0e639c; color: white; border: none; padding: 8px 16px; cursor: pointer; border-radius: 2px; margin-right: 10px; }
+        .btn:hover { background: #1177bb; }
+        .btn-secondary { background: #3c3c3c; }
+        .btn-secondary:hover { background: #4d4d4d; }
     </style>
 </head>
 <body>
     <h1>Master Dashboard <span style="font-size: 14px; font-weight: normal; color: #808080;">(State: <span id="master-state" class="state">-</span> | Uptime: <span id="uptime">-</span>)</span></h1>
     
+    <div id="prompt-container" class="prompt-box" style="display: none;">
+        <div id="prompt-text" style="margin-bottom: 15px; font-weight: bold; white-space: pre-wrap;"></div>
+        <div id="prompt-buttons"></div>
+    </div>
+
     <div id="configs-container" style="display: none; margin-bottom: 20px;">
         <strong>Available Configs:</strong> <span id="configs-list"></span>
     </div>
@@ -72,7 +101,20 @@ class DashboardHTTPRequestHandler(BaseHTTPRequestHandler):
 
     <div class="messages" id="messages-container"></div>
 
-        <script>
+    <script>
+        async function sendInput(answer) {
+            try {
+                await fetch('/api/input', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({answer: answer})
+                });
+                document.getElementById('prompt-container').style.display = 'none';
+            } catch (err) {
+                console.error("Failed to send input", err);
+            }
+        }
+
         async function fetchStatus() {
             try {
                 const res = await fetch('/api/status');
@@ -80,6 +122,29 @@ class DashboardHTTPRequestHandler(BaseHTTPRequestHandler):
                 
                 document.getElementById('master-state').textContent = data.master_state;
                 document.getElementById('uptime').textContent = data.uptime;
+                
+                if (data.active_prompt) {
+                    document.getElementById('prompt-container').style.display = 'block';
+                    document.getElementById('prompt-text').textContent = data.active_prompt;
+                    
+                    const buttonsDiv = document.getElementById('prompt-buttons');
+                    if (data.master_state === 'config selection') {
+                        buttonsDiv.innerHTML = `
+                            <button class="btn btn-secondary" onclick="sendInput('up')">↑ Move Up (w)</button>
+                            <button class="btn btn-secondary" onclick="sendInput('down')">↓ Move Down (s)</button>
+                            <button class="btn" onclick="sendInput('confirm')">✓ Select Config (y)</button>
+                            <button class="btn btn-secondary" onclick="sendInput('quit')">Quit (q)</button>
+                        `;
+                    } else {
+                        buttonsDiv.innerHTML = `
+                            <button class="btn" onclick="sendInput('confirm')">Yes (y)</button>
+                            <button class="btn btn-secondary" onclick="sendInput('decline')">No (n)</button>
+                            <button class="btn btn-secondary" onclick="sendInput('quit')">Quit (q)</button>
+                        `;
+                    }
+                } else {
+                    document.getElementById('prompt-container').style.display = 'none';
+                }
                 
                 if (data.configs && data.configs.length > 0) {
                     document.getElementById('configs-container').style.display = 'block';

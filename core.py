@@ -2208,6 +2208,15 @@ class StatusDashboard:
         self.selected_config_index: int = 0
         self.task_start_time: float | None = None
         self.active_prompt: str | None = None
+        
+        self.webserver_mode = False
+        self.pending_input_event = threading.Event()
+        self.pending_input_answer: str | None = None
+
+    def submit_input(self, answer: str) -> None:
+        """Called by web API to submit an answer to a pending prompt or config selection."""
+        self.pending_input_answer = answer
+        self.pending_input_event.set()
 
     def set_available_configs(self, configs: list[str], selected: str | None = None) -> None:
         """Set available config paths and initial selection."""
@@ -2384,8 +2393,9 @@ class StatusDashboard:
         self.messages = updated_messages
 
         # Clear screen using ANSI escape codes (avoids resetting terminal cbreak mode)
-        sys.stdout.write("\033[2J\033[H")
-        sys.stdout.flush()
+        if not getattr(self, "webserver_mode", False):
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
         """Render formatted CLI dashboard view."""
         uptime_str = ""
         if getattr(self, "task_start_time", None) is not None:
@@ -2458,12 +2468,13 @@ class StatusDashboard:
                 lines.append(line)
 
         printlog("\n".join(lines) + "\n")
-        out_str = "\n".join(lines)
-        if self.active_prompt and not self.active_prompt.endswith("\n"):
-            sys.stdout.write(out_str)
-            sys.stdout.flush()
-        else:
-            print(out_str)
+        if not getattr(self, "webserver_mode", False):
+            out_str = "\n".join(lines)
+            if self.active_prompt and not self.active_prompt.endswith("\n"):
+                sys.stdout.write(out_str)
+                sys.stdout.flush()
+            else:
+                print(out_str)
 
 
 

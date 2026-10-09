@@ -1322,7 +1322,12 @@ def check_and_distribute_binaries(
 
             # Read single-char answer (works in both tty and pipe)
             user_choice = ""
-            if sys.stdin.isatty():
+            if dashboard and getattr(dashboard, "webserver_mode", False):
+                dashboard.pending_input_event.clear()
+                dashboard.pending_input_event.wait()
+                ans = dashboard.pending_input_answer
+                user_choice = 'y' if ans == "confirm" else 'n'
+            elif sys.stdin.isatty():
                 try:
                     import termios, tty as _tty
                     fd = sys.stdin.fileno()
@@ -1418,9 +1423,11 @@ def run_master() -> None:
     dashboard.set_available_configs(available_configs, initial_config)
     
     if arguments.webserver:
+        dashboard.webserver_mode = True
         from web_dashboard import start_web_server
         start_web_server(dashboard)
         print("Web dashboard started on http://0.0.0.0:8080")
+        print("Terminal UI is suppressed. Open the browser to interact.")
 
     # Move Network Listener Initialization HERE (Outside the loop)
     mdns_announcer = MdnsAnnouncer(
@@ -1492,6 +1499,20 @@ def run_master() -> None:
                         new_cfg = dashboard.get_selected_config()
                         dashboard.set_prompt(f"Select config: {new_cfg}.\nUse 'w'/'s' to navigate. Press 'y' to confirm, 'q' to quit: ")
 
+                        if getattr(dashboard, "webserver_mode", False):
+                            dashboard.pending_input_event.clear()
+                            dashboard.pending_input_event.wait()
+                            ans = dashboard.pending_input_answer
+                            if ans == "confirm":
+                                dashboard.set_prompt(None)
+                                dashboard.add_message(f"Selected config: {new_cfg}", timeout_seconds=3)
+                                break
+                            elif ans == "up":
+                                dashboard.move_config_selection(-1)
+                            elif ans == "down":
+                                dashboard.move_config_selection(1)
+                            continue
+                            
                         if fd is not None:
                             rlist, _, _ = select.select([fd], [], [], 0.5)
                             if rlist:
@@ -1562,7 +1583,20 @@ def run_master() -> None:
                             f"Discovered {len(connected_ips)} worker(s). Config: '{selected_config_path}'.\nPress 'y' to continue, 'q' to quit ({remaining}s remaining): "
                         )
 
-                        if fd is not None:
+                        if getattr(dashboard, "webserver_mode", False):
+                            dashboard.pending_input_event.clear()
+                            # Use timeout so it updates discovery countdown
+                            dashboard.pending_input_event.wait(0.5)
+                            ans = dashboard.pending_input_answer
+                            if ans == "confirm":
+                                if len(connected_ips) < config.min_devices:
+                                    dashboard.add_message(f"Need at least {config.min_devices} workers (discovered {len(connected_ips)} so far). Waiting...", timeout_seconds=5)
+                                    dashboard.pending_input_answer = None
+                                else:
+                                    break
+                            elif ans == "quit":
+                                sys.exit(0)
+                        elif fd is not None:
                             rlist, _, _ = select.select([fd], [], [], 0.5)
                             if rlist:
                                 char = os.read(fd, 1).decode(errors="replace").lower()
@@ -1693,11 +1727,29 @@ def run_master() -> None:
             printlog("\nAll tasks and merging completed successfully.")
 
             # Multi-job prompt
-            print("\nAll tasks completed successfully!")
+            printlog("\nAll tasks completed successfully!")
             try:
-                ans = input("Do you want to process another job? [y/N]: ").strip().lower()
+                dashboard.set_prompt("Do you want to process another job? [y/N]:")
+                if getattr(dashboard, "webserver_mode", False):
+                    dashboard.pending_input_event.clear()
+                    dashboard.pending_input_event.wait()
+                    ans = "y" if dashboard.pending_input_answer == "confirm" else "n"
+                elif sys.stdin.isatty():
+                    try:
+                        import termios, tty as _tty
+                        fd = sys.stdin.fileno()
+                        old = termios.tcgetattr(fd)
+                        _tty.setcbreak(fd)
+                        ans = os.read(fd, 1).decode(errors="replace").lower()
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                    except Exception:
+                        ans = input("Do you want to process another job? [y/N]: ").strip().lower()
+                else:
+                    ans = input("Do you want to process another job? [y/N]: ").strip().lower()
             except EOFError:
                 ans = 'n'
+            finally:
+                dashboard.set_prompt(None)
 
             if ans == 'y':
                 arguments.config = None
