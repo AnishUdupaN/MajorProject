@@ -49,6 +49,13 @@ from core import (
     printlog,
     get_shared_secret,
     verify_auth_message,
+    generate_pin,
+    send_pin_challenge,
+    receive_pin_response,
+    send_pin_accepted,
+    send_pin_rejected,
+    receive_worker_telemetry,
+    rank_workers_by_affinity,
 )
 
 # clean the old log file
@@ -66,11 +73,15 @@ class WorkerConnectionPool:
         allowed_ips: list[str] | None,
         listening_socket: socket.socket,
         dashboard: StatusDashboard | None = None,
+        password: str | None = None,
     ) -> None:
         self.allowed_ips = set(allowed_ips) if allowed_ips else None
         self.listening_socket = listening_socket
         self.dashboard = dashboard
         self.connections: dict[str, socket.socket] = {}
+        self.paired_ips: set[str] = set()
+        self.session_pin = password if password else generate_pin()
+        self.worker_telemetry: dict[str, dict] = {}
         self.killed_ips: set[str] = set()
         self.lock = threading.Lock()
         self.running = True
@@ -118,12 +129,50 @@ class WorkerConnectionPool:
                 if self.allowed_ips and ip not in self.allowed_ips and endpoint not in self.allowed_ips:
                     conn.close()
                     continue
-                # VULN-07: Verify shared secret if configured
                 if self._shared_secret:
                     if not verify_auth_message(conn, self._shared_secret):
                         printlog(f"Worker {endpoint} failed authentication. Rejecting.")
                         conn.close()
                         continue
+                else:
+                    msg = f"Worker {ip} wants to join. Password/PIN: {self.session_pin}"
+                    printlog(msg)
+                    if self.dashboard:
+                        self.dashboard.add_message(msg, timeout_seconds=15)
+                        self.dashboard.add_message(f"Master Password/PIN: {self.session_pin}", timeout_seconds=60)
+                    import socket as _sock
+                    send_pin_challenge(conn, _sock.gethostname())
+                    
+                    attempts_left = 3
+                    paired = False
+                    while attempts_left > 0:
+                        try:
+                            conn.settimeout(10.0)
+                            resp = receive_pin_response(conn)
+                            conn.settimeout(None)
+                            if resp["pin"] == self.session_pin:
+                                send_pin_accepted(conn)
+                                paired = True
+                                break
+                            else:
+                                attempts_left -= 1
+                                send_pin_rejected(conn, "Invalid PIN/Password", attempts_left)
+                        except Exception as e:
+                            break
+                    if not paired:
+                        printlog(f"Worker {endpoint} failed authentication pairing. Rejecting.")
+                        conn.close()
+                        continue
+
+                try:
+                    telemetry = receive_worker_telemetry(conn)
+                    with self.lock:
+                        self.worker_telemetry[endpoint] = telemetry
+                        self.worker_telemetry[ip] = telemetry
+                except Exception as e:
+                    printlog(f"Worker {endpoint} failed to send telemetry: {e}")
+                    conn.close()
+                    continue
 
                 with self.lock:
                     if ip in self.killed_ips or endpoint in self.killed_ips or (
@@ -201,9 +250,11 @@ class WorkerConnectionPool:
                         state = existing.get("state", "idle")
                         if state in ("disconnected", "killed") or not was_connected:
                             state = "idle"
+                        telemetry = self.worker_telemetry.get(ip, {})
                         self.dashboard.update_node(
                             node_key, node_id, filename, state,
-                            receiving=False, executing=False, sending=False, connected=True
+                            receiving=False, executing=False, sending=False, connected=True,
+                            hostname=telemetry.get("hostname"), username=telemetry.get("username")
                         )
                         if not existing or not was_connected:
                             msg_action = "reconnected" if (existing and not was_connected) else "connected"
@@ -261,6 +312,8 @@ class WorkerConnectionPool:
                     send_shutdown_message(conn)
                 except Exception:
                     pass
+        import time
+        time.sleep(0.2)
 
     def stop(self) -> None:
         self.running = False
@@ -286,6 +339,11 @@ def parse_master_arguments() -> argparse.Namespace:
         "--input-video",
         default=None,
         help="Path to input video file (default: auto-detected from split_command or master/input/)",
+    )
+    parser.add_argument(
+        "--password",
+        default=None,
+        help="Static password for worker authentication (disables random PIN)",
     )
     parser.add_argument(
         "--parts-directory",
@@ -1232,7 +1290,7 @@ def check_and_distribute_binaries(
 
 
 def run_master() -> None:
-    """Load config from dashboard selection, validate addresses, split video, distribute parts, track execution, collect results, and merge."""
+    """Master node entry point: load config, validate addresses, split video, distribute parts, track execution, collect results, and merge."""
     arguments = parse_master_arguments()
 
     # Discover available config files and determine initial selection
@@ -1252,76 +1310,14 @@ def run_master() -> None:
     if initial_config not in available_configs:
         available_configs.insert(0, initial_config)
 
-
     # master/input holds split parts; master/output holds merged results.
     Path(arguments.parts_directory).mkdir(parents=True, exist_ok=True)
     Path(MASTER_OUTPUT_DIRECTORY).mkdir(parents=True, exist_ok=True)
 
-    dashboard = StatusDashboard(master_state="config selection")
-    dashboard.set_available_configs(available_configs, selected=initial_config)
+    dashboard = StatusDashboard()
+    dashboard.set_available_configs(available_configs, initial_config)
 
-    # Phase 1: Config Selection Phase (Before listening to worker connections)
-    if not arguments.config:
-        fd = None
-        old_settings = None
-        if sys.stdin.isatty():
-            try:
-                import termios
-                import tty
-
-                fd = sys.stdin.fileno()
-                old_settings = termios.tcgetattr(fd)
-                tty.setcbreak(fd)
-            except Exception:
-                fd = None
-                old_settings = None
-
-        try:
-            while True:
-                sel_cfg = dashboard.get_selected_config()
-                dashboard.add_message(
-                    f"Press 'c'/'1'-'{len(available_configs)}' to change config, 'y' or Enter to confirm, 'q' to quit",
-                    timeout_seconds=2,
-                )
-
-                if fd is not None:
-                    rlist, _, _ = select.select([fd], [], [], 0.5)
-                    if rlist:
-                        char = os.read(fd, 1).decode(errors="replace").lower()
-                        if char in ("y", "\n", "\r"):
-                            break
-                        elif char == "c":
-                            new_cfg = dashboard.select_next_config()
-                            dashboard.add_message(f"Selected config: {new_cfg}", timeout_seconds=3)
-                        elif char.isdigit() and 1 <= int(char) <= len(available_configs):
-                            new_cfg = dashboard.select_config_by_index(int(char) - 1)
-                            dashboard.add_message(f"Selected config: {new_cfg}", timeout_seconds=3)
-                        elif char == "q":
-                            print("\nUser pressed 'q'. Exiting selection...")
-                            sys.exit(0)
-                else:
-                    break
-                time.sleep(0.5)
-        finally:
-            if fd is not None and old_settings is not None:
-                try:
-                    import termios
-
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                except Exception:
-                    pass
-
-    # Load selected config after confirmation
-    selected_config_path = dashboard.get_selected_config()
-    try:
-        config = load_config(selected_config_path)
-    except ValueError as exc:
-        print(f"Config error: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Loaded config from {selected_config_path}")
-
-    # Phase 2: Start Network Listener, mDNS Announcer & Worker Pool
+    # Move Network Listener Initialization HERE (Outside the loop)
     mdns_announcer = MdnsAnnouncer(
         fqdn=MDNS_MASTER_FQDN, service=MDNS_SERVICE_MASTER
     )
@@ -1331,7 +1327,7 @@ def run_master() -> None:
     daemons: list[FileTransferDaemon] = []
     listening_socket = open_listening_socket(FIXED_PORT)
     worker_pool = WorkerConnectionPool(
-        arguments.worker_ip_addresses, listening_socket, dashboard=dashboard
+        arguments.worker_ip_addresses, listening_socket, dashboard=dashboard, password=arguments.password
     )
 
     def _master_sig_handler(signum, frame):
@@ -1365,193 +1361,238 @@ def run_master() -> None:
     except Exception:
         pass
 
-    if not arguments.worker_ip_addresses:
-        # Device Discovery Phase on Dashboard
-        dashboard.set_master_state("device discovery")
-        start_time = time.time()
-        timeout_seconds = 60.0
-        deadline = start_time + timeout_seconds
-
-        fd = None
-        old_settings = None
-        if sys.stdin.isatty():
-            try:
-                import termios
-                import tty
-
-                fd = sys.stdin.fileno()
-                old_settings = termios.tcgetattr(fd)
-                tty.setcbreak(fd)
-            except Exception:
+    try:
+        while True:
+            # Phase 1: Config Selection Phase
+            if not arguments.config:
+                dashboard.set_master_state("config selection")
                 fd = None
                 old_settings = None
+                if sys.stdin.isatty():
+                    try:
+                        import termios
+                        import tty
+                        fd = sys.stdin.fileno()
+                        old_settings = termios.tcgetattr(fd)
+                        tty.setcbreak(fd)
+                    except Exception:
+                        fd = None
+                        old_settings = None
 
-        try:
-            while True:
-                now = time.time()
-                remaining = int(max(0.0, deadline - now))
-                with worker_pool.lock:
-                    connected_ips = list(worker_pool.connections.keys())
+                try:
+                    while True:
+                        new_cfg = dashboard.get_selected_config()
+                        dashboard.add_message(f"Select config: {new_cfg}. Press 'y' to confirm, 'q' to quit.", timeout_seconds=2)
 
-                dashboard.add_message(
-                    f"Discovered {len(connected_ips)} worker(s). Config: '{selected_config_path}'. Press 'y' to continue, 'q' to quit ({remaining}s remaining)",
-                    timeout_seconds=2,
+                        if fd is not None:
+                            rlist, _, _ = select.select([fd], [], [], 0.5)
+                            if rlist:
+                                char = os.read(fd, 1).decode(errors="replace").lower()
+                                if char == "w":
+                                    dashboard.move_config_selection(-1)
+                                elif char == "s":
+                                    dashboard.move_config_selection(1)
+                                elif char in ("y", "\n", "\r"):
+                                    dashboard.add_message(f"Selected config: {new_cfg}", timeout_seconds=3)
+                                    break
+                                elif char == "q":
+                                    print("\nUser pressed 'q'. Exiting selection...")
+                                    sys.exit(0)
+                        else:
+                            break
+                        time.sleep(0.5)
+                finally:
+                    if fd is not None and old_settings is not None:
+                        try:
+                            import termios
+                            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                        except Exception:
+                            pass
+
+            selected_config_path = dashboard.get_selected_config()
+            try:
+                config = load_config(selected_config_path)
+            except ValueError as exc:
+                print(f"Config error: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+            print(f"Loaded config from {selected_config_path}")
+
+            if not arguments.worker_ip_addresses:
+                # Device Discovery Phase on Dashboard
+                dashboard.set_master_state("device discovery")
+                start_time = time.time()
+                timeout_seconds = 60.0
+                deadline = start_time + timeout_seconds
+
+                fd = None
+                old_settings = None
+                if sys.stdin.isatty():
+                    try:
+                        import termios
+                        import tty
+                        fd = sys.stdin.fileno()
+                        old_settings = termios.tcgetattr(fd)
+                        tty.setcbreak(fd)
+                    except Exception:
+                        fd = None
+                        old_settings = None
+
+                try:
+                    while True:
+                        now = time.time()
+                        remaining = int(max(0.0, deadline - now))
+                        with worker_pool.lock:
+                            connected_ips = list(worker_pool.connections.keys())
+
+                        dashboard.add_message(
+                            f"Discovered {len(connected_ips)} worker(s). Config: '{selected_config_path}'. Press 'y' to continue, 'q' to quit ({remaining}s remaining)",
+                            timeout_seconds=2,
+                        )
+
+                        if fd is not None:
+                            rlist, _, _ = select.select([fd], [], [], 0.5)
+                            if rlist:
+                                char = os.read(fd, 1).decode(errors="replace").lower()
+                                if char in ("y", "\n", "\r"):
+                                    if len(connected_ips) < config.min_devices:
+                                        dashboard.add_message(f"Need at least {config.min_devices} workers (discovered {len(connected_ips)} so far). Waiting...", timeout_seconds=5)
+                                    else:
+                                        break
+                                elif char == "q":
+                                    print("\nUser pressed 'q'. Exiting selection...")
+                                    sys.exit(0)
+                        else:
+                            if len(connected_ips) >= config.min_devices:
+                                break
+
+                        if now >= deadline:
+                            if len(connected_ips) < config.min_devices:
+                                print(f"\n[DISCOVERY TIMEOUT] Fewer than {config.min_devices} workers discovered within {int(timeout_seconds)}s. Exiting safely.", file=sys.stderr)
+                                sys.exit(0)
+                            else:
+                                print(f"\n[SELECTION TIMEOUT] Timeout reached ({int(timeout_seconds)}s). Proceeding with {len(connected_ips)} workers.")
+                                break
+                        time.sleep(0.5)
+                finally:
+                    if fd is not None and old_settings is not None:
+                        try:
+                            import termios
+                            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                        except Exception:
+                            pass
+
+            with worker_pool.lock:
+                connected_ips = list(worker_pool.connections.keys())
+
+            if arguments.worker_ip_addresses:
+                worker_addresses_to_use = arguments.worker_ip_addresses
+            else:
+                worker_addresses_to_use = connected_ips
+
+            with worker_pool.lock:
+                telemetry = dict(worker_pool.worker_telemetry)
+            
+            ranked = rank_workers_by_affinity(telemetry, config.resource_type, config.min_vram_mb)
+            sorted_addresses = [ip for ip in ranked if ip in worker_addresses_to_use]
+            for ip in worker_addresses_to_use:
+                if ip not in sorted_addresses:
+                    sorted_addresses.append(ip)
+            worker_addresses_to_use = sorted_addresses
+
+            try:
+                validate_worker_address_count(worker_addresses_to_use, config.min_devices)
+            except ValueError as exc:
+                print(f"Startup error: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+            active_nodes, spare_nodes = split_active_and_spare_addresses(worker_addresses_to_use, config.max_nodes)
+            device_mapping = write_devices_json(active_nodes)
+            print(f"Active nodes ({len(active_nodes)}): {', '.join(active_nodes)}")
+            if spare_nodes:
+                print(f"Spare nodes ({len(spare_nodes)}): {', '.join(spare_nodes)}")
+            else:
+                print("Spare nodes: None")
+
+            dashboard.total_parts = len(active_nodes)
+            dashboard.reset_nodes()
+            for idx, ip in enumerate(active_nodes, start=1):
+                is_conn = ip in worker_pool.connections
+                tel = worker_pool.worker_telemetry.get(ip, {})
+                dashboard.update_node(
+                    ip, f"node{idx}", "-", "idle" if is_conn else "disconnected", connected=is_conn,
+                    hostname=tel.get("hostname"), username=tel.get("username")
+                )
+            for ip in spare_nodes:
+                is_conn = ip in worker_pool.connections
+                tel = worker_pool.worker_telemetry.get(ip, {})
+                dashboard.update_node(
+                    ip, "spare", "-", "idle" if is_conn else "disconnected", connected=is_conn,
+                    hostname=tel.get("hostname"), username=tel.get("username")
                 )
 
-                if fd is not None:
-                    rlist, _, _ = select.select([fd], [], [], 0.5)
-                    if rlist:
-                        char = os.read(fd, 1).decode(errors="replace").lower()
-                        if char in ("y", "\n", "\r"):
-                            if len(connected_ips) < config.min_devices:
-                                dashboard.add_message(f"Need at least {config.min_devices} workers (discovered {len(connected_ips)} so far). Waiting...", timeout_seconds=5)
-                            else:
-                                break
-                        elif char == "q":
-                            print("\nUser pressed 'q'. Exiting selection...")
-                            sys.exit(0)
-                else:
-                    if len(connected_ips) >= config.min_devices:
-                        break
+            print(f"Waiting for active worker connections ({', '.join(active_nodes)})...")
+            for ip in active_nodes:
+                worker_pool.get_connection(ip)
+            print("All active workers connected!")
 
-                if now >= deadline:
-                    if len(connected_ips) < config.min_devices:
-                        print(
-                            f"\n[DISCOVERY TIMEOUT] Fewer than {config.min_devices} workers discovered within {int(timeout_seconds)}s. Exiting safely.",
-                            file=sys.stderr,
-                        )
-                        sys.exit(0)
-                    else:
-                        print(
-                            f"\n[SELECTION TIMEOUT] Timeout reached ({int(timeout_seconds)}s). Proceeding with {len(connected_ips)} workers."
-                        )
-                        break
-                time.sleep(0.5)
-        finally:
-            if fd is not None and old_settings is not None:
-                try:
-                    import termios
+            # Phase 0: Binary check
+            binary_ready_nodes, binary_idle_nodes = check_and_distribute_binaries(
+                active_nodes, worker_pool, config, master_ip_address=arguments.master_ip, dashboard=dashboard
+            )
+            active_nodes = binary_ready_nodes
+            if not active_nodes:
+                print("[BINARY] No workers have the required binary. Cannot proceed.", file=sys.stderr)
+                sys.exit(1)
 
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                except Exception:
-                    pass
-
-    with worker_pool.lock:
-        connected_ips = list(worker_pool.connections.keys())
-
-    if arguments.worker_ip_addresses:
-        worker_addresses_to_use = arguments.worker_ip_addresses
-    else:
-        worker_addresses_to_use = connected_ips
-
-    try:
-        validate_worker_address_count(
-            worker_addresses_to_use, config.min_devices
-        )
-    except ValueError as exc:
-        print(f"Startup error: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    active_nodes, spare_nodes = split_active_and_spare_addresses(
-        worker_addresses_to_use, config.max_nodes
-    )
-
-    device_mapping = write_devices_json(active_nodes)
-    print(f"Active nodes ({len(active_nodes)}): {', '.join(active_nodes)}")
-    print(f"Spare nodes ({len(spare_nodes)}): {', '.join(spare_nodes)}")
-    printlog(f"Wrote devices.json: {device_mapping}")
-
-    for idx, ip in enumerate(active_nodes, start=1):
-        is_conn = ip in worker_pool.connections
-        dashboard.update_node(
-            ip, f"node{idx}", "-", "idle" if is_conn else "disconnected",
-            connected=is_conn
-        )
-    for ip in spare_nodes:
-        is_conn = ip in worker_pool.connections
-        dashboard.update_node(
-            ip, "spare", "-", "idle" if is_conn else "disconnected",
-            connected=is_conn
-        )
-
-
-    try:
-        print(f"Waiting for active worker connections ({', '.join(active_nodes)})...")
-        for ip in active_nodes:
-            worker_pool.get_connection(ip)
-        print("All active workers connected!")
-
-        # Phase 0: Binary check & distribution (returns binary_ready, binary_idle)
-        binary_ready_nodes, binary_idle_nodes = check_and_distribute_binaries(
-            active_nodes,
-            worker_pool,
-            config,
-            master_ip_address=arguments.master_ip,
-            dashboard=dashboard,
-        )
-        # Only binary-ready workers participate in task execution.
-        # binary_idle workers remain connected in the pool but receive no tasks.
-        active_nodes = binary_ready_nodes
-        if not active_nodes:
-            print("[BINARY] No workers have the required binary. Cannot proceed.", file=sys.stderr)
-            sys.exit(1)
-
-
-
-        dashboard.set_master_state("splitting file")
-        run_split_command(
-            config.split_command,
-            len(active_nodes),
-            input_video=arguments.input_video,
-            parts_directory=arguments.parts_directory,
-        )
-        verify_part_files(
-            len(active_nodes),
-            parts_directory=arguments.parts_directory,
-            split_command=config.split_command,
-        )
-
-        for idx, ip in enumerate(active_nodes, start=1):
-            dashboard.update_node(
-                ip, f"node{idx}", part_filename_for_node(idx, split_command=config.split_command, parts_directory=arguments.parts_directory), "sending file",
-                receiving=False, executing=False, sending=True
+            dashboard.set_master_state("splitting file")
+            run_split_command(
+                config.split_command, len(active_nodes), input_video=arguments.input_video, parts_directory=arguments.parts_directory
+            )
+            verify_part_files(
+                len(active_nodes), parts_directory=arguments.parts_directory, split_command=config.split_command
             )
 
-        initial_daemons = distribute_part_files_to_active_nodes(
-            active_nodes,
-            worker_pool,
-            arguments.parts_directory,
-            master_ip_address=arguments.master_ip,
-            dashboard=dashboard,
-        )
-        daemons.extend(initial_daemons)
+            for idx, ip in enumerate(active_nodes, start=1):
+                dashboard.update_node(
+                    ip, f"node{idx}", part_filename_for_node(idx, split_command=config.split_command, parts_directory=arguments.parts_directory), "sending file",
+                    receiving=False, executing=False, sending=True
+                )
 
-        printlog("\nPhase 2 complete: split files distributed to all active workers.")
+            initial_daemons = distribute_part_files_to_active_nodes(
+                active_nodes, worker_pool, arguments.parts_directory, master_ip_address=arguments.master_ip, dashboard=dashboard
+            )
+            daemons.extend(initial_daemons)
+            printlog("\nPhase 2 complete: split files distributed to all active workers.")
 
-        # Phase 3 & Phase 4 (Task 4.1): Monitor execution, handle 1-attempt retry & failover
-        dashboard.set_master_state("executing")
-        failover_daemons = monitor_worker_executions_and_collect_results(
-            active_nodes,
-            worker_pool,
-            spare_nodes,
-            arguments.parts_directory,
-            master_ip_address=arguments.master_ip,
-            dashboard=dashboard,
-        )
-        daemons.extend(failover_daemons)
+            dashboard.set_master_state("executing")
+            failover_daemons = monitor_worker_executions_and_collect_results(
+                active_nodes, worker_pool, spare_nodes, arguments.parts_directory, master_ip_address=arguments.master_ip, dashboard=dashboard
+            )
+            daemons.extend(failover_daemons)
+            printlog("\nAll part files received.")
 
-        printlog("\nAll part files received.")
+            dashboard.set_master_state("merging files")
+            run_merge_command(
+                config.merge_command, len(active_nodes), output_directory=MASTER_OUTPUT_DIRECTORY, split_command=config.split_command
+            )
+            dashboard.set_master_state("finished")
+            printlog("\nAll tasks and merging completed successfully.")
 
-        # Phase 4 (Task 4.2): Merge output part files into single final video
-        dashboard.set_master_state("merging files")
-        run_merge_command(
-            config.merge_command,
-            len(active_nodes),
-            output_directory=MASTER_OUTPUT_DIRECTORY,
-            split_command=config.split_command,
-        )
-        dashboard.set_master_state("finished")
-        printlog("\nAll tasks and merging completed successfully.")
+            # Multi-job prompt
+            print("\nAll tasks completed successfully!")
+            try:
+                ans = input("Do you want to process another job? [y/N]: ").strip().lower()
+            except EOFError:
+                ans = 'n'
+
+            if ans == 'y':
+                arguments.config = None
+                continue
+            else:
+                print("Exiting master.")
+                worker_pool.shutdown_all_workers()
+                break
 
     except KeyboardInterrupt:
         print("\nMaster shutting down.")
@@ -1559,7 +1600,7 @@ def run_master() -> None:
         print(f"Master error: {exc}", file=sys.stderr)
         sys.exit(1)
     finally:
-        if 'worker_pool' in locals() and worker_pool:
+        if worker_pool:
             try:
                 worker_pool.shutdown_all_workers()
             except Exception:
@@ -1570,7 +1611,7 @@ def run_master() -> None:
                 daemon.stop()
             except Exception:
                 pass
-        if 'listening_socket' in locals() and listening_socket:
+        if listening_socket:
             try:
                 listening_socket.close()
             except Exception:
@@ -1580,7 +1621,6 @@ def run_master() -> None:
             output_directory=MASTER_OUTPUT_DIRECTORY,
             input_video=arguments.input_video,
         )
-
 
 if __name__ == "__main__":
     run_master()

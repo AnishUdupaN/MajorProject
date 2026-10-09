@@ -68,6 +68,11 @@ MESSAGE_TYPE_AUTH = "auth"
 MESSAGE_TYPE_BINARY_INFO_REQUEST = "binary_info_request"
 MESSAGE_TYPE_BINARY_INFO = "binary_info"
 MESSAGE_TYPE_BINARY_READY = "binary_ready"
+MESSAGE_TYPE_WORKER_TELEMETRY = "worker_telemetry"
+MESSAGE_TYPE_PIN_CHALLENGE = "pin_challenge"
+MESSAGE_TYPE_PIN_RESPONSE = "pin_response"
+MESSAGE_TYPE_PIN_ACCEPTED = "pin_accepted"
+MESSAGE_TYPE_PIN_REJECTED = "pin_rejected"
 
 # Message schema validation: required keys for each message type.
 MESSAGE_REQUIRED_KEYS = {
@@ -81,6 +86,11 @@ MESSAGE_REQUIRED_KEYS = {
     MESSAGE_TYPE_BINARY_INFO_REQUEST: ['type', 'binary_name'],
     MESSAGE_TYPE_BINARY_INFO: ['type', 'os_name', 'arch', 'binary_name', 'has_binary', 'md5'],
     MESSAGE_TYPE_BINARY_READY: ['type'],
+    MESSAGE_TYPE_WORKER_TELEMETRY: ['type', 'single_core_score', 'multi_core_score', 'os_type', 'cpu_count'],
+    MESSAGE_TYPE_PIN_CHALLENGE: ['type', 'master_name'],
+    MESSAGE_TYPE_PIN_RESPONSE: ['type', 'pin'],
+    MESSAGE_TYPE_PIN_ACCEPTED: ['type'],
+    MESSAGE_TYPE_PIN_REJECTED: ['type', 'reason', 'attempts_left'],
 }
 
 
@@ -148,8 +158,7 @@ DEFAULT_INPUT_VIDEO = f"{MASTER_INPUT_DIRECTORY}/input.mkv"
 # supported targets: linux (x64) and macos (aarch64)
 BINARY_PLATFORM_MAP: dict[tuple[str, str], tuple[str, str]] = {
     ("Linux",   "x86_64"):  ("linux", "x64"),
-    ("Darwin",  "arm64"):   ("macos", "aarch64"),
-    ("Darwin",  "aarch64"): ("macos", "aarch64"),
+    ("Darwin",  "arm64"):   ("macos", "arm64"),
 }
 
 
@@ -285,6 +294,59 @@ def receive_binary_ready(connection: socket.socket) -> None:
         raise ValueError(f"Expected binary_ready message, got: {msg!r}")
 
 
+def send_worker_telemetry(connection: socket.socket, telemetry: dict) -> None:
+    send_json_message(connection, {"type": MESSAGE_TYPE_WORKER_TELEMETRY, **telemetry})
+
+
+def receive_worker_telemetry(connection: socket.socket) -> dict:
+    msg = receive_json_message(connection)
+    validate_message(msg)
+    if msg["type"] != MESSAGE_TYPE_WORKER_TELEMETRY:
+        raise ValueError(f"Expected worker_telemetry, got {msg['type']}")
+    return msg
+
+
+def generate_pin() -> str:
+    import random
+    bad_pins = {"0000", "1111", "1234", "4321", "9876", "0123"}
+    while True:
+        pin = f"{random.randint(0, 9999):04d}"
+        if pin not in bad_pins:
+            return pin
+
+
+def send_pin_challenge(connection: socket.socket, master_name: str) -> None:
+    send_json_message(connection, {"type": MESSAGE_TYPE_PIN_CHALLENGE, "master_name": master_name})
+
+
+def receive_pin_challenge(connection: socket.socket) -> dict:
+    msg = receive_json_message(connection)
+    validate_message(msg)
+    if msg["type"] != MESSAGE_TYPE_PIN_CHALLENGE:
+        raise ValueError(f"Expected pin_challenge, got {msg['type']}")
+    return msg
+
+
+def send_pin_response(connection: socket.socket, pin: str) -> None:
+    send_json_message(connection, {"type": MESSAGE_TYPE_PIN_RESPONSE, "pin": pin})
+
+
+def receive_pin_response(connection: socket.socket) -> dict:
+    msg = receive_json_message(connection)
+    validate_message(msg)
+    if msg["type"] != MESSAGE_TYPE_PIN_RESPONSE:
+        raise ValueError(f"Expected pin_response, got {msg['type']}")
+    return msg
+
+
+def send_pin_accepted(connection: socket.socket) -> None:
+    send_json_message(connection, {"type": MESSAGE_TYPE_PIN_ACCEPTED})
+
+
+def send_pin_rejected(connection: socket.socket, reason: str, attempts_left: int) -> None:
+    send_json_message(connection, {"type": MESSAGE_TYPE_PIN_REJECTED, "reason": reason, "attempts_left": attempts_left})
+
+
 
 
 # ==============================================================================
@@ -312,6 +374,61 @@ class Config:
     binary_name: str = ""
     binaries_directory: str = "binaries"
     require_binary: bool = False
+    resource_type: str = "auto"
+    min_vram_mb: int = 0
+    # OS-specific command overrides for bare-metal execution
+    split_command_windows: str = ""
+    split_command_macos: str = ""
+    split_command_linux: str = ""
+    execute_command_windows: str = ""
+    execute_command_macos: str = ""
+    execute_command_linux: str = ""
+    merge_command_windows: str = ""
+    merge_command_macos: str = ""
+    merge_command_linux: str = ""
+
+    def get_execute_command(self, os_type: str | None = None) -> str:
+        """Return platform-specific execute command, falling back to execute_command."""
+        if not os_type:
+            os_type = platform.system().lower()
+        else:
+            os_type = os_type.lower()
+        if ("win" in os_type) and self.execute_command_windows:
+            return self.execute_command_windows
+        elif ("darwin" in os_type or "mac" in os_type) and self.execute_command_macos:
+            return self.execute_command_macos
+        elif ("linux" in os_type) and self.execute_command_linux:
+            return self.execute_command_linux
+        return self.execute_command
+
+    def get_split_command(self, os_type: str | None = None) -> str:
+        """Return platform-specific split command, falling back to split_command."""
+        if not os_type:
+            os_type = platform.system().lower()
+        else:
+            os_type = os_type.lower()
+        if ("win" in os_type) and self.split_command_windows:
+            return self.split_command_windows
+        elif ("darwin" in os_type or "mac" in os_type) and self.split_command_macos:
+            return self.split_command_macos
+        elif ("linux" in os_type) and self.split_command_linux:
+            return self.split_command_linux
+        return self.split_command
+
+    def get_merge_command(self, os_type: str | None = None) -> str:
+        """Return platform-specific merge command, falling back to merge_command."""
+        if not os_type:
+            os_type = platform.system().lower()
+        else:
+            os_type = os_type.lower()
+        if ("win" in os_type) and self.merge_command_windows:
+            return self.merge_command_windows
+        elif ("darwin" in os_type or "mac" in os_type) and self.merge_command_macos:
+            return self.merge_command_macos
+        elif ("linux" in os_type) and self.merge_command_linux:
+            return self.merge_command_linux
+        return self.merge_command
+
 
 
 _LOG_LOCK = threading.Lock()
@@ -406,7 +523,19 @@ def load_config(config_path: str) -> Config:
         binary_name=section.get("binary_name", "").strip(),
         binaries_directory=section.get("binaries_directory", "binaries").strip(),
         require_binary=section.getboolean("require_binary", fallback=False),
+        resource_type=section.get("resource_type", "auto").strip().lower(),
+        min_vram_mb=section.getint("min_vram_mb", fallback=0),
+        split_command_windows=section.get("split_command_windows", "").strip(),
+        split_command_macos=section.get("split_command_macos", "").strip(),
+        split_command_linux=section.get("split_command_linux", "").strip(),
+        execute_command_windows=section.get("execute_command_windows", "").strip(),
+        execute_command_macos=section.get("execute_command_macos", "").strip(),
+        execute_command_linux=section.get("execute_command_linux", "").strip(),
+        merge_command_windows=section.get("merge_command_windows", "").strip(),
+        merge_command_macos=section.get("merge_command_macos", "").strip(),
+        merge_command_linux=section.get("merge_command_linux", "").strip(),
     )
+
 
 
 
@@ -750,10 +879,14 @@ def send_json_message(connection: socket.socket, message: dict) -> None:
     connection.sendall(payload.encode("utf-8"))
 
 
-def receive_json_message(connection: socket.socket) -> dict:
+def receive_json_message(connection: socket.socket, timeout: float | None = None) -> dict:
     """Receive one JSON control message from the connection, buffering extra lines."""
     buf = _SOCKET_BUFFERS.get(connection, "")
     while "\n" not in buf:
+        if timeout is not None:
+            r, _, _ = select.select([connection], [], [], timeout)
+            if not r:
+                raise TimeoutError("Timeout waiting for JSON message")
         chunk = connection.recv(4096)
         if not chunk:
             _SOCKET_BUFFERS.pop(connection, None)
@@ -778,22 +911,22 @@ def send_shutdown_message(connection: socket.socket) -> None:
 
 
 def send_ready_message(
-    connection: socket.socket, master_ip_address: str, file_transfer_port: int
+    connection: socket.socket, master_ip_address: str, file_transfer_port: int, execute_command: str | None = None
 ) -> None:
     """Master sends a ready message with this node's file-transfer daemon port."""
-    send_json_message(
-        connection,
-        {
-            "type": MESSAGE_TYPE_READY,
-            "master_ip_address": master_ip_address,
-            "file_transfer_port": file_transfer_port,
-        },
-    )
+    msg = {
+        "type": MESSAGE_TYPE_READY,
+        "master_ip_address": master_ip_address,
+        "file_transfer_port": file_transfer_port,
+    }
+    if execute_command:
+        msg["execute_command"] = execute_command
+    send_json_message(connection, msg)
 
 
-def receive_ready_message(connection: socket.socket) -> dict:
+def receive_ready_message(connection: socket.socket, timeout: float | None = None) -> dict:
     """Worker receives the ready message from the master."""
-    message = receive_json_message(connection)
+    message = receive_json_message(connection, timeout=timeout)
     if message.get("type") == MESSAGE_TYPE_SHUTDOWN:
         raise MasterShutdownError("Master sent shutdown signal")
     if message.get("type") != MESSAGE_TYPE_READY:
@@ -1406,6 +1539,11 @@ class ProcessCpuTracker:
 def set_process_nice(pid: int, nice_value: int) -> bool:
     """Set nice priority score for a process PID."""
     try:
+        # On macOS, os.setpriority() may fail silently when raising niceness.
+        # Force fallback to psutil for macOS to ensure it maps correctly.
+        import sys
+        if sys.platform == "darwin":
+            raise OSError("Force psutil fallback on macOS")
         os.setpriority(os.PRIO_PROCESS, pid, nice_value)
         return True
     except Exception:
@@ -1907,6 +2045,39 @@ def build_merge_command(
     return resolved
 
 
+def resolve_output_file(
+    merge_command_template: str,
+    output_directory: str = MASTER_OUTPUT_DIRECTORY,
+) -> Path:
+    """Resolve the merged output file path by checking the merge command or output directory."""
+    resolved_command = build_merge_command(merge_command_template, output_directory)
+    out_dir_path = Path(output_directory).resolve()
+
+    try:
+        command_parts = shlex.split(resolved_command)
+        for part in reversed(command_parts):
+            try:
+                p = Path(part).resolve()
+                if (out_dir_path in p.parents or p.parent == out_dir_path) and p.name != "filelist.txt" and not p.name.startswith("part"):
+                    if p.is_file():
+                        return p
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    out_dir = Path(output_directory)
+    if out_dir.is_dir():
+        for candidate in out_dir.glob("output.*"):
+            if candidate.is_file():
+                return candidate
+        for candidate in out_dir.iterdir():
+            if candidate.is_file() and candidate.name != "filelist.txt" and not candidate.name.startswith("part"):
+                return candidate
+
+    return Path(output_directory) / "output.mkv"
+
+
 def run_merge_command(
     merge_command_template: str,
     active_node_count: int,
@@ -1932,7 +2103,7 @@ def run_merge_command(
             f"merge_command failed with exit code {result.returncode}:\n{result.stderr.strip()}"
         )
 
-    final_output_path = Path(output_directory) / "output.mkv"
+    final_output_path = resolve_output_file(merge_command_template, output_directory)
     if not final_output_path.is_file():
         raise FileNotFoundError(
             f"Merged output file not found at expected location: {final_output_path}"
@@ -2057,6 +2228,12 @@ class StatusDashboard:
             if self.available_configs and 0 <= self.selected_config_index < len(self.available_configs):
                 return self.available_configs[self.selected_config_index]
             return "config.ini"
+            
+    def reset_nodes(self) -> None:
+        """Clear the current node states."""
+        with self.lock:
+            self.node_states.clear()
+            self._render_unlocked()
 
     def add_message(self, text: str, timeout_seconds: int = 10) -> None:
         """Add an event/alert message with a countdown period to the dashboard (idea.txt)."""
@@ -2102,6 +2279,8 @@ class StatusDashboard:
         executing: bool | None = None,
         sending: bool | None = None,
         connected: bool | None = None,
+        hostname: str | None = None,
+        username: str | None = None,
     ) -> None:
         """Update individual worker node state and flags."""
         with self.lock:
@@ -2122,6 +2301,8 @@ class StatusDashboard:
                 "executing": exc,
                 "sending": snd,
                 "connected": conn,
+                "hostname": hostname if hostname is not None else existing.get("hostname"),
+                "username": username if username is not None else existing.get("username"),
             }
             self._render_unlocked()
 
@@ -2182,9 +2363,9 @@ class StatusDashboard:
 
         if self.master_state != "config selection":
             lines.append(
-                f"{'NODE IP':<16} {'DEVICE':<10} {'CONNECTED':<11} {'PART FILE':<12} {'STATE':<20} {'FLAGS [R/E/S]':<14} {'PROGRESS / RUN TIME'}"
+                f"{'NODE IP (USER@HOST)':<32} {'DEVICE':<10} {'CONNECTED':<11} {'PART FILE':<12} {'STATE':<20} {'FLAGS [R/E/S]':<14} {'PROGRESS / RUN TIME'}"
             )
-            lines.append("-" * (len(header) + 12))
+            lines.append("-" * (len(header) + 12 + 16))
 
             if not self.node_states:
                 lines.append("  (Waiting for worker connections...)")
@@ -2210,8 +2391,13 @@ class StatusDashboard:
                         prog_parts.append(f"[ETA: {eta}]")
 
                     prog_str = " ".join(prog_parts)
+                    
+                    display_ip = ip
+                    if info.get("hostname") and info.get("username"):
+                        display_ip = f"{ip}({info['username']}@{info['hostname']})"
+                        
                     lines.append(
-                        f"{ip:<16} {info['node_id']:<10} {conn_str:<11} {info['filename']:<12} {state_str:<20} {flags_str:<14} {prog_str}"
+                        f"{display_ip:<32} {info['node_id']:<10} {conn_str:<11} {info['filename']:<12} {state_str:<20} {flags_str:<14} {prog_str}"
                     )
 
 
@@ -2226,6 +2412,213 @@ class StatusDashboard:
         print("\n".join(lines))
 
 
+
+# ==============================================================================
+# SECTION X: HARDWARE BENCHMARKING & TELEMETRY
+# ==============================================================================
+
+def benchmark_single_core(duration_seconds: float = 0.5) -> float:
+    import hashlib
+    data = b"benchmark_payload_block_" * 43
+    count = 0
+    start = time.time()
+    while time.time() - start < duration_seconds:
+        hashlib.sha256(data).digest()
+        count += 1
+    elapsed = time.time() - start
+    return count / elapsed if elapsed > 0 else 0.0
+
+def benchmark_multi_core(duration_seconds: float = 1.0) -> float:
+    num_cores = os.cpu_count() or 1
+    per_core_duration = max(0.2, duration_seconds / 2)
+    try:
+        from multiprocessing import Pool
+        with Pool(num_cores) as pool:
+            scores = pool.starmap(benchmark_single_core, [(per_core_duration,)] * num_cores)
+        return sum(scores)
+    except Exception:
+        single = benchmark_single_core(duration_seconds)
+        return single * num_cores
+
+def detect_gpu_info() -> dict:
+    info = {"gpu_name": "", "vram_mb": 0, "hw_encoders": []}
+    if platform.system() == "Linux":
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                line = result.stdout.strip().split("\n")[0]
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 2:
+                    info["gpu_name"] = parts[0]
+                    info["vram_mb"] = int(float(parts[1]))
+                    info["hw_encoders"].extend(["h264_nvenc", "hevc_nvenc"])
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+            pass
+    if platform.system() == "Darwin":
+        try:
+            result = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType", "-json"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                displays = data.get("SPDisplaysDataType", [])
+                if displays:
+                    gpu = displays[0]
+                    info["gpu_name"] = gpu.get("sppci_model", "Apple Silicon GPU")
+                    info["hw_encoders"].extend(["h264_videotoolbox", "hevc_videotoolbox"])
+        except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            pass
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            known_hw_encoders = [
+                "h264_nvenc", "hevc_nvenc",
+                "h264_videotoolbox", "hevc_videotoolbox",
+                "h264_qsv", "hevc_qsv",
+                "h264_vaapi", "hevc_vaapi",
+            ]
+            for enc in known_hw_encoders:
+                if enc in result.stdout and enc not in info["hw_encoders"]:
+                    info["hw_encoders"].append(enc)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return info
+
+def detect_power_state() -> dict:
+    info = {"is_plugged_in": True, "battery_pct": 100, "has_battery": False}
+    try:
+        import psutil
+        battery = psutil.sensors_battery()
+        if battery is not None:
+            info["has_battery"] = True
+            info["is_plugged_in"] = bool(battery.power_plugged)
+            info["battery_pct"] = int(battery.percent)
+    except Exception:
+        pass
+    return info
+
+def _get_total_ram_mb() -> int:
+    try:
+        import psutil
+        return psutil.virtual_memory().total // (1024 * 1024)
+    except Exception:
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) // 1024
+        except Exception:
+            pass
+    return 0
+
+def run_node_benchmark() -> dict:
+    import getpass
+    power = detect_power_state()
+    gpu = detect_gpu_info()
+    
+    try:
+        username = getpass.getuser()
+    except Exception:
+        username = "unknown"
+        
+    result = {
+        "single_core_score": round(benchmark_single_core(0.5), 1),
+        "multi_core_score": round(benchmark_multi_core(1.0), 1),
+        "gpu_name": gpu["gpu_name"],
+        "vram_mb": gpu["vram_mb"],
+        "hw_encoders": gpu["hw_encoders"],
+        "os_type": platform.system().lower(),
+        "cpu_count": os.cpu_count() or 1,
+        "total_ram_mb": _get_total_ram_mb(),
+        "is_plugged_in": power.get("is_plugged_in", True),
+        "battery_pct": power.get("battery_pct", 100),
+        "has_battery": power.get("has_battery", False),
+        "hostname": socket.gethostname(),
+        "username": username,
+    }
+    
+    print(f"  Single-core: {result['single_core_score']:.0f} ops/s")
+    print(f"  Multi-core:  {result['multi_core_score']:.0f} ops/s ({result['cpu_count']} cores)")
+    if result["gpu_name"]:
+        print(f"  GPU: {result['gpu_name']} ({result['vram_mb']} MB VRAM)")
+    print(f"  RAM: {result['total_ram_mb']} MB | Power: {'AC' if result['is_plugged_in'] else 'Battery'} ({result['battery_pct']}%)")
+    
+    return result
+
+
+UDP_DISCOVERY_PORT = 5005
+DISCOVERY_BEACON_TYPE = "DISCOVERY_BEACON"
+MASTER_OFFER_TYPE = "MASTER_OFFER"
+
+def start_udp_discovery_listener(master_ip: str, control_port: int) -> threading.Thread:
+    """Listen for UDP broadcast beacons and reply with master info."""
+    def listener():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except Exception:
+                pass
+        sock.bind(("", UDP_DISCOVERY_PORT))
+        while True:
+            try:
+                data, addr = sock.recvfrom(1024)
+                if data.decode("utf-8").strip() == DISCOVERY_BEACON_TYPE:
+                    reply = f"{MASTER_OFFER_TYPE}:{master_ip}:{control_port}"
+                    sock.sendto(reply.encode("utf-8"), addr)
+            except Exception:
+                pass
+    
+    t = threading.Thread(target=listener, daemon=True)
+    t.start()
+    return t
+
+def discover_master_udp(timeout_seconds: float = 30.0) -> tuple[str, int]:
+    """Broadcast UDP beacons and wait for master offer."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(2.0)
+    
+    end_time = time.time() + timeout_seconds
+    while time.time() < end_time:
+        try:
+            sock.sendto(DISCOVERY_BEACON_TYPE.encode("utf-8"), ("255.255.255.255", UDP_DISCOVERY_PORT))
+            data, addr = sock.recvfrom(1024)
+            msg = data.decode("utf-8").strip()
+            if msg.startswith(MASTER_OFFER_TYPE):
+                parts = msg.split(":")
+                if len(parts) >= 3:
+                    return parts[1], int(parts[2])
+        except (socket.timeout, OSError):
+            pass
+        time.sleep(1.0)
+    raise TimeoutError("UDP discovery timed out")
+
+def rank_workers_by_affinity(telemetry_map: dict[str, dict], resource_type: str, min_vram_mb: int = 0) -> list[str]:
+    valid = []
+    for ip, tel in telemetry_map.items():
+        if tel.get("has_battery") and tel.get("battery_pct", 100) < 20 and not tel.get("is_plugged_in"):
+            continue
+        if resource_type == "gpu" and tel.get("vram_mb", 0) < min_vram_mb:
+            continue
+        valid.append((ip, tel))
+        
+    if resource_type == "single_core":
+        valid.sort(key=lambda x: x[1].get("single_core_score", 0), reverse=True)
+    elif resource_type == "multi_core":
+        valid.sort(key=lambda x: x[1].get("multi_core_score", 0), reverse=True)
+    elif resource_type == "gpu":
+        valid.sort(key=lambda x: x[1].get("vram_mb", 0), reverse=True)
+    
+    return [x[0] for x in valid]
 
 # ==============================================================================
 # SUBPROCESS ENTRY POINT FOR STANDALONE FILE-TRANSFER DAEMON

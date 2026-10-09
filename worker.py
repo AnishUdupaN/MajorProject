@@ -22,6 +22,7 @@ from core import (
     cleanup_worker_temporary_files,
     compute_md5,
     discover_master_ip,
+    discover_master_udp,
     get_worker_platform,
     get_available_configs,
     load_config,
@@ -39,6 +40,13 @@ from core import (
     send_file_received_message,
     send_finished_message,
     upload_result_file,
+    receive_pin_challenge,
+    send_pin_response,
+    receive_json_message,
+    MESSAGE_TYPE_PIN_ACCEPTED,
+    MESSAGE_TYPE_PIN_REJECTED,
+    run_node_benchmark,
+    send_worker_telemetry,
 )
 
 
@@ -51,6 +59,11 @@ def parse_worker_arguments() -> argparse.Namespace:
         "--config",
         default=None,
         help="Path to the config file (default: auto-discovered from config/ directory)",
+    )
+    parser.add_argument(
+        "--password",
+        default=None,
+        help="Static password for connection authentication",
     )
     parser.add_argument(
         "--download-directory",
@@ -209,8 +222,9 @@ def run_worker_task(
     downloaded_path = None
     output_filepath = None
     try:
-        ready_message = receive_ready_message(connection)
+        ready_message = receive_ready_message(connection, timeout=600.0)
         file_transfer_port = ready_message["file_transfer_port"]
+        execute_cmd = ready_message.get("execute_command", execute_command_template)
 
         downloaded_path = fetch_allocated_part_file(
             master_ip_address,
@@ -225,7 +239,7 @@ def run_worker_task(
         # Force-stops process if connection is lost or user presses 'k'.
         try:
             elapsed_time = run_execute_command(
-                execute_command_template,
+                execute_cmd,
                 input_file=downloaded_path,
                 output_directory=WORKER_OUTPUT_DIRECTORY,
                 connection=connection,
@@ -306,12 +320,19 @@ def run_worker() -> None:
     mdns_announcer.start()
 
     if not master_ip_address:
-        print("No master IP address specified. Auto-discovering Master via mDNS...")
+        print("No master IP address specified. Auto-discovering Master...")
         try:
-            master_ip_address = discover_master_ip(timeout_seconds=60.0)
-        except TimeoutError as exc:
-            print(f"Discovery error: {exc}", file=sys.stderr)
-            sys.exit(1)
+            # Try mDNS first (works on home routers with mDNS reflectors)
+            master_ip_address = discover_master_ip(timeout_seconds=10.0)
+            print(f"Found master via mDNS: {master_ip_address}")
+        except TimeoutError:
+            print("mDNS timed out. Trying UDP broadcast (works on mobile hotspots)...")
+            try:
+                master_ip_address, _ = discover_master_udp(timeout_seconds=30.0)
+                print(f"Found master via UDP broadcast: {master_ip_address}")
+            except TimeoutError:
+                print("Error: Could not discover master on the network.", file=sys.stderr)
+                sys.exit(1)
 
     print(f"Connecting to Master at {master_ip_address}:{FIXED_PORT}...")
     print("Press 'k' to kill the task.")
@@ -339,6 +360,8 @@ def run_worker() -> None:
     except Exception:
         pass
 
+    cached_pin = arguments.password
+
     try:
         while True:
             if connection is None:
@@ -361,8 +384,34 @@ def run_worker() -> None:
                     # VULN-08: Send shared secret for authentication if configured
                     if shared_secret:
                         send_auth_message(connection, shared_secret)
+                    else:
+                        challenge = receive_pin_challenge(connection)
+                        master_name = challenge.get("master_name", "unknown")
+                        if cached_pin:
+                            pin = cached_pin
+                        else:
+                            pin = input(f"Master '{master_name}' requests pairing. Enter Password/PIN shown on master's screen: ")
+                            cached_pin = pin.strip()
+                        send_pin_response(connection, pin.strip())
+                        
+                        resp = receive_json_message(connection)
+                        if resp.get("type") == MESSAGE_TYPE_PIN_REJECTED:
+                            print(f"Pairing rejected: {resp.get('reason')}. Retrying...", file=sys.stderr)
+                            cached_pin = arguments.password  # Reset to arg if present, else None
+                            connection.close()
+                            connection = None
+                            continue
+                        elif resp.get("type") != MESSAGE_TYPE_PIN_ACCEPTED:
+                            print(f"Unexpected response during PIN pairing: {resp}", file=sys.stderr)
+                            sys.exit(1)
+                            
                     # Phase 0: Perform binary handshake (no-op if require_binary=false)
                     do_binary_handshake(connection, master_ip_address, config)
+                    
+                    # Run hardware benchmark (~2 seconds)
+                    print("Running hardware benchmarks...")
+                    telemetry = run_node_benchmark()
+                    send_worker_telemetry(connection, telemetry)
                     reconnect_start_time = None
                 except OSError as exc:
                     print(f"Connection attempt failed ({exc}). Retrying in 2 seconds...", file=sys.stderr)
@@ -403,16 +452,22 @@ def run_worker() -> None:
                 simulate_fail = None
                 print("Node state: IDLE. Reconnecting to master...")
                 time.sleep(0.5)
-            except (ConnectionError, OSError) as exc:
-                print(f"\nControl socket disconnected ({exc}). Reconnecting to master...", file=sys.stderr)
+            except TimeoutError:
+                print("\nNo tasks received for 10 minutes. Exiting to save resources.")
                 if connection:
                     try:
                         connection.close()
                     except Exception:
                         pass
-                connection = None
-                active_conn_ref[0] = None
-                time.sleep(1.0)
+                sys.exit(0)
+            except (ConnectionError, OSError) as exc:
+                print(f"\nControl socket disconnected after pairing ({exc}). Exiting safely without retrying.", file=sys.stderr)
+                if connection:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+                sys.exit(0)
             except (RuntimeError, ValueError) as exc:
                 print(f"\nTask error ({exc}). Reconnecting to master...", file=sys.stderr)
                 if connection:
