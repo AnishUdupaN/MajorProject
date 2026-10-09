@@ -2318,6 +2318,12 @@ class StatusDashboard:
             snd = sending if sending is not None else existing.get("sending", False)
             conn = connected if connected is not None else existing.get("connected", True)
 
+            if state in ("disconnected", "killed") and ":" in node_ip:
+                if node_ip in self.node_states:
+                    del self.node_states[node_ip]
+                self._render_unlocked()
+                return
+
             self.node_states[node_ip] = {
                 "node_id": node_id,
                 "filename": filename,
@@ -2342,10 +2348,14 @@ class StatusDashboard:
             if node_ip in self.node_states:
                 self.node_states[node_ip]["connected"] = connected
                 if not connected:
-                    self.node_states[node_ip]["state"] = state or "disconnected"
-                    self.node_states[node_ip]["receiving"] = False
-                    self.node_states[node_ip]["executing"] = False
-                    self.node_states[node_ip]["sending"] = False
+                    st = state or "disconnected"
+                    if st in ("disconnected", "killed") and ":" in node_ip:
+                        del self.node_states[node_ip]
+                    else:
+                        self.node_states[node_ip]["state"] = st
+                        self.node_states[node_ip]["receiving"] = False
+                        self.node_states[node_ip]["executing"] = False
+                        self.node_states[node_ip]["sending"] = False
                 elif state:
                     self.node_states[node_ip]["state"] = state
                 self._render_unlocked()

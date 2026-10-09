@@ -1514,6 +1514,9 @@ def run_master() -> None:
                 sys.exit(1)
 
             print(f"Loaded config from {selected_config_path}")
+            
+            # Hide the config selection UI
+            dashboard.set_available_configs([])
 
             if not arguments.worker_ip_addresses:
                 # Device Discovery Phase on Dashboard

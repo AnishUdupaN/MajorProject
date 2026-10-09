@@ -297,14 +297,15 @@ def run_worker_task(
         part_filename = Path(downloaded_path).name
         output_filepath = Path(WORKER_OUTPUT_DIRECTORY) / part_filename
 
+        # Send finished signal to Master over control port BEFORE upload starts
+        # This allows the master dashboard to show "Receiving Files" during the upload
+        send_finished_message(connection, elapsed_time, part_filename)
+
         # Phase 4 Task 4.1: Upload completed output file back to Master's per-node file-transfer daemon FIRST
         if output_filepath.is_file():
             print(f"\n[STATUS] Sending result file to master...")
             upload_result_file(master_ip_address, file_transfer_port, str(output_filepath))
             print(f"[STATUS] Sent result {part_filename} to master.")
-
-        # Send finished signal to Master over control port AFTER upload completes
-        send_finished_message(connection, elapsed_time, part_filename)
 
         print(f"{PROGRESS_FINISHED} for worker ({part_filename})")
     finally:
