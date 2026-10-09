@@ -387,7 +387,6 @@ def run_worker() -> None:
                         master_ip_address, FIXED_PORT, bind_ip=arguments.bind_ip
                     )
                     active_conn_ref[0] = connection
-                    print("Connected to master. Node state: IDLE. Waiting for task assignment...")
                     # VULN-08: Send shared secret for authentication if configured
                     if shared_secret:
                         send_auth_message(connection, shared_secret)
@@ -412,13 +411,15 @@ def run_worker() -> None:
                             print(f"Unexpected response during PIN pairing: {resp}", file=sys.stderr)
                             sys.exit(1)
                             
-                    # Phase 0: Perform binary handshake (no-op if require_binary=false)
-                    do_binary_handshake(connection, master_ip_address, config)
-                    
                     # Run hardware benchmark (~2 seconds)
                     print("Running hardware benchmarks...")
                     telemetry = run_node_benchmark()
                     send_worker_telemetry(connection, telemetry)
+
+                    # Phase 0: Perform binary handshake
+                    do_binary_handshake(connection, master_ip_address, config)
+                    
+                    print("Connected to master. Node state: IDLE. Waiting for task assignment...")
                     reconnect_start_time = None
                 except OSError as exc:
                     print(f"Connection attempt failed ({exc}). Retrying in 2 seconds...", file=sys.stderr)

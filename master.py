@@ -962,6 +962,26 @@ def reassign_task_to_spare_node(
             )
 
         spare_connection = worker_pool.get_connection(spare_ip)
+        
+        # Phase 0: Binary check for spare node
+        ready_nodes, _ = check_and_distribute_binaries(
+            [spare_ip], worker_pool, config, master_ip_address, dashboard
+        )
+        if spare_ip not in ready_nodes:
+            printlog(f"[FAILOVER] Spare node {spare_ip} failed binary handshake.")
+            return handle_no_spare_nodes_recovery(
+                failed_ip,
+                node_index,
+                part_filename_for_node(node_index),
+                spare_nodes,
+                worker_pool,
+                active_tasks if active_tasks is not None else {},
+                parts_directory,
+                master_ip_address,
+                dashboard,
+                config=config,
+            )
+
         part_filename = part_filename_for_node(node_index)
 
         if dashboard:
@@ -1113,6 +1133,13 @@ def monitor_worker_executions_and_collect_results(
                             printlog(f"[RETRY FAILED] Node {ip} did not reconnect within timeout.")
 
                         if retry_conn:
+                            ready_nodes, _ = check_and_distribute_binaries(
+                                [ip], worker_pool, config, master_ip_address, dashboard
+                            )
+                            if ip not in ready_nodes:
+                                printlog(f"[RETRY FAILED] Node {ip} failed binary handshake.")
+                                continue
+
                             daemon = distribute_part_file_to_single_node(
                                 ip,
                                 part_filename,
