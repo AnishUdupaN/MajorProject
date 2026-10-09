@@ -138,8 +138,8 @@ class WorkerConnectionPool:
                     msg = f"Worker {ip} wants to join. Password/PIN: {self.session_pin}"
                     printlog(msg)
                     if self.dashboard:
-                        self.dashboard.add_message(msg, timeout_seconds=15)
-                        self.dashboard.add_message(f"Master Password/PIN: {self.session_pin}", timeout_seconds=60)
+                        self.dashboard.add_message(msg, timeout_seconds=120)
+                        self.dashboard.add_message(f"Master Password/PIN: {self.session_pin}", timeout_seconds=120)
                     import socket as _sock
                     send_pin_challenge(conn, _sock.gethostname())
                     
@@ -485,6 +485,7 @@ def handle_no_spare_nodes_recovery(
     parts_directory: str,
     master_ip_address: str | None = None,
     dashboard: StatusDashboard | None = None,
+    config: Config | None = None,
 ) -> tuple[str, socket.socket, FileTransferDaemon]:
     """When no spare nodes are available, ask user to (k)ill task, (w)ait 1 minute for new nodes, (r)eassign to a healthy node when finished, or (b)oth (listen for new nodes & fallback)."""
     printlog(f"\n[RECOVERY ALERT] Node {failed_ip} failed and no spare nodes are available for recovery.")
@@ -573,11 +574,18 @@ def handle_no_spare_nodes_recovery(
                 elapsed_wait = int(time.time() - wait_start)
                 remaining = int(wait_timeout - elapsed_wait)
 
+                idle_ips = set()
                 with worker_pool.lock:
                     for ip in list(worker_pool.connections.keys()):
-                        if ip not in active_tasks:
-                            found_spare_ip = ip
-                            break
+                        base_ip = ip.split(":")[0]
+                        if ip not in active_tasks and base_ip not in active_tasks and ip not in worker_pool.killed_ips and base_ip not in worker_pool.killed_ips:
+                            idle_ips.add(ip)
+                if idle_ips:
+                    resource_type = config.resource_type if config else "auto"
+                    idle_telemetry = {ip: worker_pool.worker_telemetry.get(ip, {}) for ip in idle_ips}
+                    ranked_ips = rank_workers_by_affinity(idle_telemetry, resource_type)
+                    if ranked_ips:
+                        found_spare_ip = ranked_ips[0]
 
                 if found_spare_ip:
                     print(f"\n[NEW NODE CONNECTED] Discovered new node {found_spare_ip}!")
@@ -748,11 +756,18 @@ def handle_no_spare_nodes_recovery(
                 elapsed_wait = int(time.time() - wait_start)
                 remaining = int(wait_timeout - elapsed_wait)
 
+                idle_ips = set()
                 with worker_pool.lock:
                     for ip in list(worker_pool.connections.keys()):
-                        if ip not in active_tasks:
-                            found_spare_ip = ip
-                            break
+                        base_ip = ip.split(":")[0]
+                        if ip not in active_tasks and base_ip not in active_tasks and ip not in worker_pool.killed_ips and base_ip not in worker_pool.killed_ips:
+                            idle_ips.add(ip)
+                if idle_ips:
+                    resource_type = config.resource_type if config else "auto"
+                    idle_telemetry = {ip: worker_pool.worker_telemetry.get(ip, {}) for ip in idle_ips}
+                    ranked_ips = rank_workers_by_affinity(idle_telemetry, resource_type)
+                    if ranked_ips:
+                        found_spare_ip = ranked_ips[0]
 
                 if found_spare_ip:
                     print(f"\n[NEW NODE CONNECTED] Discovered new node {found_spare_ip}!")
@@ -899,17 +914,31 @@ def reassign_task_to_spare_node(
     master_ip_address: str | None = None,
     active_tasks: dict[str, dict] | None = None,
     dashboard: StatusDashboard | None = None,
+    config: Config | None = None,
 ) -> tuple[str, socket.socket, FileTransferDaemon]:
     """Swap IP in devices.json and reassign task to the next spare node or prompt user if no spare is available."""
-    spare_ip = None
-    if spare_nodes:
-        spare_ip = spare_nodes.pop(0)
-    elif active_tasks is not None:
+    idle_ips = set()
+    if active_tasks is not None:
         with worker_pool.lock:
             for ip in list(worker_pool.connections.keys()):
-                if ip not in active_tasks:
-                    spare_ip = ip
-                    break
+                base_ip = ip.split(":")[0]
+                if ip not in active_tasks and base_ip not in active_tasks and ip not in worker_pool.killed_ips and base_ip not in worker_pool.killed_ips:
+                    idle_ips.add(ip)
+
+    for ip in list(spare_nodes):
+        base_ip = ip.split(":")[0]
+        if (active_tasks is None or (ip not in active_tasks and base_ip not in active_tasks)) and ip not in worker_pool.killed_ips and base_ip not in worker_pool.killed_ips:
+            idle_ips.add(ip)
+
+    spare_ip = None
+    if idle_ips:
+        resource_type = config.resource_type if config else "auto"
+        idle_telemetry = {ip: worker_pool.worker_telemetry.get(ip, {}) for ip in idle_ips}
+        ranked_ips = rank_workers_by_affinity(idle_telemetry, resource_type)
+        if ranked_ips:
+            spare_ip = ranked_ips[0]
+            if spare_ip in spare_nodes:
+                spare_nodes.remove(spare_ip)
 
     if spare_ip:
         printlog(f"\n Node {failed_ip} failed. Reassigning task to node{node_index}, {spare_ip}")
@@ -952,6 +981,7 @@ def reassign_task_to_spare_node(
             parts_directory,
             master_ip_address,
             dashboard,
+            config=config,
         )
 
 
@@ -962,6 +992,7 @@ def monitor_worker_executions_and_collect_results(
     parts_directory: str,
     master_ip_address: str | None = None,
     dashboard: StatusDashboard | None = None,
+    config: Config | None = None,
 ) -> list[FileTransferDaemon]:
     """Track execution and result collection, supporting 1-attempt same-node retry before spare failover."""
     active_tasks: dict[str, dict] = {}
@@ -1065,7 +1096,9 @@ def monitor_worker_executions_and_collect_results(
 
                         retry_conn = None
                         try:
-                            retry_conn = worker_pool.get_connection(ip, timeout_seconds=8.0)
+                            if dashboard:
+                                dashboard.add_message(f"Waiting for node {ip} to reconnect...", timeout_seconds=30)
+                            retry_conn = worker_pool.get_connection(ip, timeout_seconds=30.0)
 
                         except TimeoutError:
                             printlog(f"[RETRY FAILED] Node {ip} did not reconnect within timeout.")
@@ -1100,6 +1133,7 @@ def monitor_worker_executions_and_collect_results(
                         master_ip_address,
                         active_tasks=active_tasks,
                         dashboard=dashboard,
+                        config=config,
                     )
                     active_daemons.append(daemon)
                     active_tasks[spare_ip] = {
@@ -1567,7 +1601,7 @@ def run_master() -> None:
 
             dashboard.set_master_state("executing")
             failover_daemons = monitor_worker_executions_and_collect_results(
-                active_nodes, worker_pool, spare_nodes, arguments.parts_directory, master_ip_address=arguments.master_ip, dashboard=dashboard
+                active_nodes, worker_pool, spare_nodes, arguments.parts_directory, master_ip_address=arguments.master_ip, dashboard=dashboard, config=config
             )
             daemons.extend(failover_daemons)
             printlog("\nAll part files received.")

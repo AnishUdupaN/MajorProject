@@ -2528,15 +2528,38 @@ def run_node_benchmark() -> dict:
     except Exception:
         username = "unknown"
         
+    predefined_scores = {}
+    worker_devices_json = os.path.join(WORKER_DIRECTORY, "devices.json")
+    worker_scores_json = os.path.join(WORKER_DIRECTORY, "scores.json")
+    # Fall back to project root if worker/ paths don't exist
+    if not os.path.exists(worker_scores_json) and os.path.exists("scores.json"):
+        worker_scores_json = "scores.json"
+    if not os.path.exists(worker_devices_json) and os.path.exists("devices.json"):
+        worker_devices_json = "devices.json"
+    try:
+        if os.path.exists(worker_scores_json) and os.path.exists(worker_devices_json):
+            with open(worker_devices_json, "r") as f:
+                devices_data = json.load(f)
+                cpu_name = devices_data.get("cpu_name")
+            if cpu_name:
+                with open(worker_scores_json, "r") as f:
+                    scores_data = json.load(f)
+                if cpu_name in scores_data:
+                    entry = scores_data[cpu_name]
+                    if entry.get("single_core_score", 0) > 0 and entry.get("multi_core_score", 0) > 0:
+                        predefined_scores = entry
+    except Exception:
+        pass
+        
     result = {
-        "single_core_score": round(benchmark_single_core(0.5), 1),
-        "multi_core_score": round(benchmark_multi_core(1.0), 1),
+        "single_core_score": predefined_scores.get("single_core_score") if predefined_scores else round(benchmark_single_core(0.5), 1),
+        "multi_core_score": predefined_scores.get("multi_core_score") if predefined_scores else round(benchmark_multi_core(1.0), 1),
         "gpu_name": gpu["gpu_name"],
         "vram_mb": gpu["vram_mb"],
         "hw_encoders": gpu["hw_encoders"],
         "os_type": platform.system().lower(),
         "cpu_count": os.cpu_count() or 1,
-        "total_ram_mb": _get_total_ram_mb(),
+        "total_ram_mb": predefined_scores.get("total_ram_mb", _get_total_ram_mb()),
         "is_plugged_in": power.get("is_plugged_in", True),
         "battery_pct": power.get("battery_pct", 100),
         "has_battery": power.get("has_battery", False),
@@ -2613,7 +2636,7 @@ def rank_workers_by_affinity(telemetry_map: dict[str, dict], resource_type: str,
         
     if resource_type == "single_core":
         valid.sort(key=lambda x: x[1].get("single_core_score", 0), reverse=True)
-    elif resource_type == "multi_core":
+    elif resource_type in ("multi_core", "auto"):
         valid.sort(key=lambda x: x[1].get("multi_core_score", 0), reverse=True)
     elif resource_type == "gpu":
         valid.sort(key=lambda x: x[1].get("vram_mb", 0), reverse=True)

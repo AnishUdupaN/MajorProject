@@ -1,0 +1,17 @@
+{
+  "i5 13500H": {
+    "single_core_score": 28500.0,
+    "multi_core_score": 310000.0,
+    "total_ram_mb": 16384
+  },
+  "Apple M4": {
+    "single_core_score": 35200.0,
+    "multi_core_score": 285000.0,
+    "total_ram_mb": 16384
+  },
+  "i5 11400U": {
+    "single_core_score": 19800.0,
+    "multi_core_score": 105000.0,
+    "total_ram_mb": 8192
+  }
+}

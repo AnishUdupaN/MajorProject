@@ -21,6 +21,7 @@ from core import (
     MdnsAnnouncer,
     cleanup_worker_temporary_files,
     compute_md5,
+    printlog,
     discover_master_ip,
     discover_master_udp,
     get_worker_platform,
@@ -461,13 +462,15 @@ def run_worker() -> None:
                         pass
                 sys.exit(0)
             except (ConnectionError, OSError) as exc:
-                print(f"\nControl socket disconnected after pairing ({exc}). Exiting safely without retrying.", file=sys.stderr)
+                print(f"\nControl socket disconnected after pairing ({exc}). Reconnecting to master...", file=sys.stderr)
                 if connection:
                     try:
                         connection.close()
                     except Exception:
                         pass
-                sys.exit(0)
+                connection = None
+                active_conn_ref[0] = None
+                time.sleep(1.0)
             except (RuntimeError, ValueError) as exc:
                 print(f"\nTask error ({exc}). Reconnecting to master...", file=sys.stderr)
                 if connection:
