@@ -2211,6 +2211,7 @@ class StatusDashboard:
         self.webserver_mode = False
         self.pending_input_event = threading.Event()
         self.pending_input_answer: str | None = None
+        self.session_pin: str | None = None
 
     def submit_input(self, answer: str) -> None:
         """Called by web API to submit an answer to a pending prompt or config selection."""
@@ -2394,7 +2395,8 @@ class StatusDashboard:
             um, us = uptime // 60, uptime % 60
             uptime_str = f" [UPTIME: {um:02d}:{us:02d}]"
 
-        header = f"=== MASTER DASHBOARD: [{self.master_state.upper()}]{uptime_str} ==="
+        pin_str = f" [PIN: {self.session_pin}]" if getattr(self, "session_pin", None) else ""
+        header = f"=== MASTER DASHBOARD: [{self.master_state.upper()}]{pin_str}{uptime_str} ==="
         divider = "=" * (len(header) + 12)
 
         lines = ["", divider, header, divider]
@@ -2465,8 +2467,8 @@ class StatusDashboard:
 
         # Only write to stdout in terminal (non-webserver) mode
         if not getattr(self, "webserver_mode", False):
-            # Clear screen with ANSI codes (safe with cbreak mode — avoids curses)
-            sys.stdout.write("\033[2J\033[H")
+            # Clear cursor to home, clear screen, and clear scrollback buffer
+            sys.stdout.write("\033[H\033[2J\033[3J")
             sys.stdout.write(out_str)
             if not out_str.endswith("\n"):
                 sys.stdout.write("\n")

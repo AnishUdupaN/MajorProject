@@ -404,10 +404,12 @@ def run_worker() -> None:
         pass
 
     cached_pin = arguments.password
+    early_ready: dict | None = None
 
     try:
         while True:
             if connection is None:
+                early_ready = None
                 if reconnect_start_time is None:
                     reconnect_start_time = time.time()
                 elif time.time() - reconnect_start_time >= max_reconnect_timeout:
@@ -442,6 +444,7 @@ def run_worker() -> None:
                             cached_pin = arguments.password  # Reset to arg if present, else None
                             connection.close()
                             connection = None
+                            active_conn_ref[0] = None
                             continue
                         elif resp.get("type") != MESSAGE_TYPE_PIN_ACCEPTED:
                             print(f"Unexpected response during PIN pairing: {resp}", file=sys.stderr)
@@ -457,8 +460,24 @@ def run_worker() -> None:
                     
                     print("Connected to master. Node state: IDLE. Waiting for task assignment...")
                     reconnect_start_time = None
-                except OSError as exc:
+                except MasterShutdownError:
+                    print("\nMaster completed processing and initiated shutdown. Exiting safely.")
+                    if connection:
+                        try:
+                            connection.close()
+                        except Exception:
+                            pass
+                    sys.exit(0)
+                except (OSError, ConnectionError, ValueError, RuntimeError) as exc:
                     print(f"Connection attempt failed ({exc}). Retrying in 2 seconds...", file=sys.stderr)
+                    if connection:
+                        try:
+                            connection.close()
+                        except Exception:
+                            pass
+                    connection = None
+                    active_conn_ref[0] = None
+                    early_ready = None
                     time.sleep(2.0)
                     continue
 
@@ -475,6 +494,7 @@ def run_worker() -> None:
                     config=config,
                     early_ready_msg=early_ready,
                 )
+                early_ready = None
                 print("Task completed. Node returning to IDLE state. Waiting for next task...")
 
             except MasterShutdownError:

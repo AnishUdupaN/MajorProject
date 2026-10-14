@@ -81,6 +81,8 @@ class WorkerConnectionPool:
         self.connections: dict[str, socket.socket] = {}
         self.paired_ips: set[str] = set()
         self.session_pin = password if password else generate_pin()
+        if self.dashboard:
+            self.dashboard.session_pin = self.session_pin
         self.worker_telemetry: dict[str, dict] = {}
         self.killed_ips: set[str] = set()
         self.lock = threading.Lock()
@@ -135,11 +137,8 @@ class WorkerConnectionPool:
                         conn.close()
                         continue
                 else:
-                    msg = f"Worker {ip} wants to join. Password/PIN: {self.session_pin}"
+                    msg = f"Worker {ip} pairing request (PIN: {self.session_pin})"
                     printlog(msg)
-                    if self.dashboard:
-                        self.dashboard.add_message(msg, timeout_seconds=120)
-                        self.dashboard.add_message(f"Master Password/PIN: {self.session_pin}", timeout_seconds=120)
                     import socket as _sock
                     send_pin_challenge(conn, _sock.gethostname())
                     
@@ -147,7 +146,7 @@ class WorkerConnectionPool:
                     paired = False
                     while attempts_left > 0:
                         try:
-                            conn.settimeout(10.0)
+                            conn.settimeout(120.0)  # Generous 2-minute window to enter PIN
                             resp = receive_pin_response(conn)
                             conn.settimeout(None)
                             if resp["pin"] == self.session_pin:

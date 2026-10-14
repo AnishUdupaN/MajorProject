@@ -62,6 +62,7 @@ class DashboardHTTPRequestHandler(BaseHTTPRequestHandler):
 
             data = {
                 "master_state": self.dashboard.master_state,
+                "session_pin": getattr(self.dashboard, "session_pin", None),
                 "node_states": self.dashboard.node_states,
                 "messages": messages_out[-20:],
                 "configs": self.dashboard.available_configs,
@@ -343,6 +344,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div class="header-row">
   <h1>Master Dashboard</h1>
   <span class="state-badge" id="state-badge">—</span>
+  <span class="state-badge" id="pin-badge" style="display:none; color:var(--yellow); border-color:var(--yellow)">PIN: <span id="pin-val">—</span></span>
   <span class="header-meta">Uptime: <span id="uptime">—</span></span>
   <span class="conn-pill" id="conn-pill">
     <span class="conn-dot" id="conn-dot"></span>
@@ -458,6 +460,14 @@ function render(data) {
   badge.textContent = state.toUpperCase();
   badge.style.color = stateCls(state).startsWith('s-') ? '' : '';  // keep neutral for now
   document.getElementById('uptime').textContent = fmtUptime(data.uptime);
+
+  const pinBadge = document.getElementById('pin-badge');
+  if (data.session_pin) {
+    pinBadge.style.display = '';
+    document.getElementById('pin-val').textContent = data.session_pin;
+  } else {
+    pinBadge.style.display = 'none';
+  }
 
   // -- prompt box
   const promptBox  = document.getElementById('prompt-box');
