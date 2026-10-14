@@ -86,7 +86,7 @@ MESSAGE_REQUIRED_KEYS = {
     MESSAGE_TYPE_BINARY_INFO_REQUEST: ['type', 'binary_name'],
     MESSAGE_TYPE_BINARY_INFO: ['type', 'os_name', 'arch', 'binary_name', 'has_binary', 'md5'],
     MESSAGE_TYPE_BINARY_READY: ['type'],
-    MESSAGE_TYPE_WORKER_TELEMETRY: ['type', 'single_core_score', 'multi_core_score', 'os_type', 'cpu_count'],
+    MESSAGE_TYPE_WORKER_TELEMETRY: ['type', 'single_core_score', 'multi_core_score', 'os_type', 'cpu_count', 'gpu_score', 'ram_mb'],
     MESSAGE_TYPE_PIN_CHALLENGE: ['type', 'master_name'],
     MESSAGE_TYPE_PIN_RESPONSE: ['type', 'pin'],
     MESSAGE_TYPE_PIN_ACCEPTED: ['type'],
@@ -2203,7 +2203,6 @@ class StatusDashboard:
         self.merging_flag = False
         self.node_states: Dict[str, Dict[str, Any]] = {}
         self.messages: list[dict] = []
-        self._last_render_time = time.time()
         self.available_configs: list[str] = []
         self.selected_config_index: int = 0
         self.task_start_time: float | None = None
@@ -2270,7 +2269,7 @@ class StatusDashboard:
     def add_message(self, text: str, timeout_seconds: int = 10) -> None:
         """Add an event/alert message with a countdown period to the dashboard (idea.txt)."""
         with self.lock:
-            self.messages.append({"text": text, "time_left": float(timeout_seconds)})
+            self.messages.append({"text": text, "expire_at": time.time() + float(timeout_seconds)})
             self._render_unlocked()
 
     def set_master_state(self, state: str) -> None:
@@ -2380,29 +2379,21 @@ class StatusDashboard:
             self._render_unlocked()
 
     def _render_unlocked(self) -> None:
+        """Render formatted CLI dashboard view, or update internal state only in webserver mode."""
         now = time.time()
-        dt = now - self._last_render_time
-        self._last_render_time = now
 
-        # Update message countdowns and clear expired messages (idea.txt)
-        updated_messages = []
-        for msg in self.messages:
-            msg["time_left"] -= dt
-            if msg["time_left"] > 0:
-                updated_messages.append(msg)
-        self.messages = updated_messages
+        # Filter expired messages using wall-clock expire_at (avoids rapid-render expiry bug)
+        self.messages = [
+            m for m in self.messages
+            if now < m.get("expire_at", now + m.get("time_left", 0))
+        ]
 
-        # Clear screen using ANSI escape codes (avoids resetting terminal cbreak mode)
-        if not getattr(self, "webserver_mode", False):
-            sys.stdout.write("\033[2J\033[H")
-            sys.stdout.flush()
-        """Render formatted CLI dashboard view."""
         uptime_str = ""
-        if getattr(self, "task_start_time", None) is not None:
-            uptime = int(time.time() - self.task_start_time)
+        if self.task_start_time is not None:
+            uptime = int(now - self.task_start_time)
             um, us = uptime // 60, uptime % 60
             uptime_str = f" [UPTIME: {um:02d}:{us:02d}]"
-            
+
         header = f"=== MASTER DASHBOARD: [{self.master_state.upper()}]{uptime_str} ==="
         divider = "=" * (len(header) + 12)
 
@@ -2411,7 +2402,7 @@ class StatusDashboard:
         if self.available_configs:
             lines.append("CONFIG FILE SELECTION:")
             for idx, cfg in enumerate(self.available_configs):
-                marker = "► [SELECTED]" if idx == self.selected_config_index else " "
+                marker = "► [SELECTED]" if idx == self.selected_config_index else "  "
                 lines.append(f"  [{idx + 1}] {cfg:<30} {marker}")
             lines.append("-" * (len(header) + 12))
 
@@ -2445,36 +2436,41 @@ class StatusDashboard:
                         prog_parts.append(f"[ETA: {eta}]")
 
                     prog_str = " ".join(prog_parts)
-                    
+
                     display_ip = ip
                     if info.get("hostname") and info.get("username"):
                         display_ip = f"{ip}({info['username']}@{info['hostname']})"
-                        
+
                     lines.append(
                         f"{display_ip:<32} {info['node_id']:<10} {conn_str:<11} {info['filename']:<12} {state_str:<20} {flags_str:<14} {prog_str}"
                     )
-
 
         if self.messages:
             lines.append(divider)
             lines.append("MESSAGES / ALERTS:")
             for m in self.messages:
-                lines.append(f"  • {m['text']} ({int(m['time_left'])}s left)")
+                secs_left = int(m["expire_at"] - now) if "expire_at" in m else int(m.get("time_left", 0))
+                lines.append(f"  • {m['text']} ({max(0, secs_left)}s left)")
 
         lines.append(divider)
-        
+
         if self.active_prompt:
             for line in self.active_prompt.split('\n'):
                 lines.append(line)
 
-        printlog("\n".join(lines) + "\n")
+        out_str = "\n".join(lines)
+
+        # Always log to file
+        printlog(out_str + "\n")
+
+        # Only write to stdout in terminal (non-webserver) mode
         if not getattr(self, "webserver_mode", False):
-            out_str = "\n".join(lines)
-            if self.active_prompt and not self.active_prompt.endswith("\n"):
-                sys.stdout.write(out_str)
-                sys.stdout.flush()
-            else:
-                print(out_str)
+            # Clear screen with ANSI codes (safe with cbreak mode — avoids curses)
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.write(out_str)
+            if not out_str.endswith("\n"):
+                sys.stdout.write("\n")
+            sys.stdout.flush()
 
 
 
@@ -2616,63 +2612,143 @@ def _get_total_ram_mb() -> int:
     return 0
 
 def run_node_benchmark() -> dict:
+    """Run hardware benchmark binary (persistent cache) and return telemetry dict.
+
+    On first run: executes ./binaries/benchmark/<os>/bench, parses JSON output,
+    saves to worker/benchmark_results.json for future reuse.
+    On subsequent runs: loads cached result directly without re-running binary.
+    Falls back to Python-based benchmark if binary is missing or fails.
+    """
     import getpass
+    import subprocess as _subp
+
+    # --- helpers ---
     power = detect_power_state()
-    gpu = detect_gpu_info()
-    
+    gpu_info = detect_gpu_info()
     try:
         username = getpass.getuser()
     except Exception:
         username = "unknown"
-        
-    predefined_scores = {}
-    worker_devices_json = os.path.join(WORKER_DIRECTORY, "devices.json")
-    worker_scores_json = os.path.join(WORKER_DIRECTORY, "scores.json")
-    # Fall back to project root if worker/ paths don't exist
-    if not os.path.exists(worker_scores_json) and os.path.exists("scores.json"):
-        worker_scores_json = "scores.json"
-    if not os.path.exists(worker_devices_json) and os.path.exists("devices.json"):
-        worker_devices_json = "devices.json"
-    try:
-        if os.path.exists(worker_scores_json) and os.path.exists(worker_devices_json):
-            with open(worker_devices_json, "r") as f:
-                devices_data = json.load(f)
-                cpu_name = devices_data.get("cpu_name")
-            if cpu_name:
-                with open(worker_scores_json, "r") as f:
-                    scores_data = json.load(f)
-                if cpu_name in scores_data:
-                    entry = scores_data[cpu_name]
-                    if entry.get("single_core_score", 0) > 0 and entry.get("multi_core_score", 0) > 0:
-                        predefined_scores = entry
-    except Exception:
-        pass
-        
-    cpu_name_detected = detect_cpu_name()
+    hostname_str = socket.gethostname()
+    os_type_str = platform.system().lower()
+    cpu_count_val = os.cpu_count() or 1
+
+    # Cache paths - check standard locations in root and worker directory
+    worker_dir = Path(WORKER_DIRECTORY)
+    candidate_cache_files = [
+        Path("benchmark.json"),
+        Path("benchmark_results.json"),
+        worker_dir / "benchmark.json",
+        worker_dir / "benchmark_results.json",
+    ]
+    REQUIRED_BENCH_KEYS = {"ram_mb", "vram_mb", "single_core_score", "multi_core_score", "gpu_score"}
+
+    bench_data: dict | None = None
+
+    # --- 1. Try loading from cache ---
+    for cp in candidate_cache_files:
+        if cp.is_file():
+            try:
+                with open(cp, "r") as _f:
+                    _cached = json.load(_f)
+                if REQUIRED_BENCH_KEYS.issubset(_cached.keys()):
+                    bench_data = _cached
+                    print(f"[BENCHMARK] Loaded cached results from {cp}")
+                    break
+            except Exception as _e:
+                print(f"[BENCHMARK] Cache read from {cp} failed ({_e})")
+
+    # --- 2. Run binary if no valid cache ---
+    if bench_data is None:
+        # Determine binary path based on OS
+        sys_name = platform.system()
+        os_folder = "macos" if sys_name == "Darwin" else "linux"
+        candidate_binaries = [
+            Path("binaries") / "benchmark" / os_folder / "bench",
+            Path(__file__).resolve().parent / "binaries" / "benchmark" / os_folder / "bench",
+        ]
+        bench_binary = None
+        for cb in candidate_binaries:
+            if cb.is_file():
+                bench_binary = cb
+                break
+
+        if bench_binary is not None:
+            try:
+                import stat as _stat
+                if not os.access(bench_binary, os.X_OK):
+                    bench_binary.chmod(bench_binary.stat().st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+
+                print(f"[BENCHMARK] Running {bench_binary} ...")
+                result_proc = _subp.run(
+                    [str(bench_binary)],
+                    capture_output=True, text=True, timeout=120
+                )
+                if result_proc.returncode == 0 and result_proc.stdout.strip():
+                    bench_data = json.loads(result_proc.stdout.strip())
+                    if not REQUIRED_BENCH_KEYS.issubset(bench_data.keys()):
+                        print(f"[BENCHMARK] Binary output missing expected keys, falling back to Python benchmark")
+                        bench_data = None
+                else:
+                    print(f"[BENCHMARK] Binary exited {result_proc.returncode}: {result_proc.stderr.strip()[:200]}")
+            except Exception as _e:
+                print(f"[BENCHMARK] Binary failed ({_e}), falling back to Python benchmark")
+                bench_data = None
+        else:
+            print(f"[BENCHMARK] Binary not found at ./binaries/benchmark/{os_folder}/bench, using Python benchmark")
+
+    # --- 3. Python fallback if binary failed/missing ---
+    if bench_data is None:
+        print("[BENCHMARK] Running Python-based benchmark (slower)...")
+        bench_data = {
+            "single_core_score": round(benchmark_single_core(0.5), 1),
+            "multi_core_score": round(benchmark_multi_core(1.0), 1),
+            "gpu_score": float(gpu_info.get("vram_mb", 0)) * 10.0,
+            "ram_mb": _get_total_ram_mb(),
+            "vram_mb": gpu_info.get("vram_mb", 0),
+        }
+
+    # --- 4. Save cache for persistent access ---
+    for save_path in [Path("benchmark.json"), worker_dir / "benchmark_results.json"]:
+        try:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(save_path, "w") as _f:
+                json.dump(bench_data, _f, indent=2)
+            print(f"[BENCHMARK] Results saved to {save_path}")
+        except Exception as _e:
+            pass
+
+    # --- 5. Build full telemetry result ---
+    cpu_name_str = detect_cpu_name()
     result = {
-        "cpu_name": predefined_scores.get("cpu_name", cpu_name_detected) if predefined_scores else cpu_name_detected,
-        "single_core_score": predefined_scores.get("single_core_score") if predefined_scores else round(benchmark_single_core(0.5), 1),
-        "multi_core_score": predefined_scores.get("multi_core_score") if predefined_scores else round(benchmark_multi_core(1.0), 1),
-        "gpu_name": gpu["gpu_name"],
-        "vram_mb": gpu["vram_mb"],
-        "hw_encoders": gpu["hw_encoders"],
-        "os_type": platform.system().lower(),
-        "cpu_count": os.cpu_count() or 1,
-        "total_ram_mb": predefined_scores.get("total_ram_mb", _get_total_ram_mb()),
-        "is_plugged_in": power.get("is_plugged_in", True),
-        "battery_pct": power.get("battery_pct", 100),
-        "has_battery": power.get("has_battery", False),
-        "hostname": socket.gethostname(),
-        "username": username,
+        "cpu_name":          cpu_name_str,
+        "single_core_score": float(bench_data["single_core_score"]),
+        "multi_core_score":  float(bench_data["multi_core_score"]),
+        "gpu_score":         float(bench_data.get("gpu_score", 0.0)),
+        "ram_mb":            int(bench_data.get("ram_mb", _get_total_ram_mb())),
+        "gpu_name":          gpu_info["gpu_name"],
+        "vram_mb":           int(bench_data.get("vram_mb", gpu_info["vram_mb"])),
+        "hw_encoders":       gpu_info["hw_encoders"],
+        "os_type":           os_type_str,
+        "cpu_count":         cpu_count_val,
+        "total_ram_mb":      int(bench_data.get("ram_mb", _get_total_ram_mb())),
+        "is_plugged_in":     power.get("is_plugged_in", True),
+        "battery_pct":       power.get("battery_pct", 100),
+        "has_battery":       power.get("has_battery", False),
+        "hostname":          hostname_str,
+        "username":          username,
     }
-    
+
+    # --- 6. Print summary ---
     print(f"  CPU: {result['cpu_name']} ({result['cpu_count']} cores)")
-    print(f"  Single-core: {result['single_core_score']:.0f} ops/s")
-    print(f"  Multi-core:  {result['multi_core_score']:.0f} ops/s")
-    if result["gpu_name"]:
-        print(f"  GPU: {result['gpu_name']} ({result['vram_mb']} MB VRAM)")
-    print(f"  RAM: {result['total_ram_mb']} MB | Power: {'AC' if result['is_plugged_in'] else 'Battery'} ({result['battery_pct']}%)")
-    
+    print(f"  Single-core: {result['single_core_score']:.1f} | Multi-core: {result['multi_core_score']:.1f}")
+    print(f"  RAM: {result['ram_mb']} MB")
+    if result["gpu_score"] > 0:
+        print(f"  GPU score: {result['gpu_score']:.1f} | VRAM: {result['vram_mb']} MB")
+    else:
+        print(f"  GPU: not detected (gpu_score=0, treated as lowest priority for GPU tasks)")
+    print(f"  Power: {'AC' if result['is_plugged_in'] else 'Battery'} ({result['battery_pct']}%)")
+
     return result
 
 
@@ -2725,23 +2801,128 @@ def discover_master_udp(timeout_seconds: float = 30.0) -> tuple[str, int]:
         time.sleep(1.0)
     raise TimeoutError("UDP discovery timed out")
 
-def rank_workers_by_affinity(telemetry_map: dict[str, dict], resource_type: str, min_vram_mb: int = 0) -> list[str]:
-    valid = []
-    for ip, tel in telemetry_map.items():
-        if tel.get("has_battery") and tel.get("battery_pct", 100) < 20 and not tel.get("is_plugged_in"):
-            continue
-        if resource_type == "gpu" and tel.get("vram_mb", 0) < min_vram_mb:
-            continue
-        valid.append((ip, tel))
-        
-    if resource_type == "single_core":
-        valid.sort(key=lambda x: x[1].get("single_core_score", 0), reverse=True)
-    elif resource_type in ("multi_core", "auto"):
-        valid.sort(key=lambda x: x[1].get("multi_core_score", 0), reverse=True)
-    elif resource_type == "gpu":
-        valid.sort(key=lambda x: x[1].get("vram_mb", 0), reverse=True)
-    
-    return [x[0] for x in valid]
+def rank_workers_by_affinity(
+    telemetry_map: dict[str, dict],
+    resource_type: str,
+    min_vram_mb: int = 0,
+    worker_addresses: list[str] | None = None,
+) -> list[str]:
+    """Rank worker IPs by affinity for the given resource_type.
+
+    Priority rules:
+      - For 'gpu': devices where gpu_score == 0 or vram_mb == 0 (or vram_mb < min_vram_mb)
+        could not cleanly check those values / lack GPU capability, so they are placed
+        at LEAST priority (last-resort fallback).
+        GPU-capable devices are sorted primarily by gpu_score (descending), then vram_mb,
+        then multi_core_score.
+        GPU-lacking fallback devices are sorted by multi_core_score (descending).
+      - For 'single_core': sorted by single_core_score descending, tie-break by multi_core_score.
+      - For 'multi_core' / 'auto': sorted by multi_core_score descending, tie-break by single_core_score.
+      - Devices with low battery (< 20% and not plugged in) are placed after healthy devices in their tier.
+      - Devices with no telemetry data are always placed at the very end.
+    """
+    def _get_telemetry(addr: str) -> dict:
+        if addr in telemetry_map:
+            return telemetry_map[addr]
+        base_ip = addr.split(":")[0]
+        if base_ip in telemetry_map:
+            return telemetry_map[base_ip]
+        return {}
+
+    def _is_low_battery(tel: dict) -> bool:
+        return (
+            bool(tel.get("has_battery", False))
+            and tel.get("battery_pct", 100) < 20
+            and not tel.get("is_plugged_in", True)
+        )
+
+    def _has_no_telemetry(tel: dict) -> bool:
+        return not tel or tel.get("single_core_score") is None
+
+    # Determine candidate addresses to rank
+    if worker_addresses is not None:
+        candidates = []
+        for addr in worker_addresses:
+            if addr not in candidates:
+                candidates.append(addr)
+    else:
+        candidates = list(telemetry_map.keys())
+
+    rt = (resource_type or "auto").lower()
+
+    if rt == "gpu":
+        gpu_capable = []
+        gpu_lacking = []
+        for addr in candidates:
+            tel = _get_telemetry(addr)
+            vram = int(tel.get("vram_mb", 0) or 0)
+            gscore = float(tel.get("gpu_score", 0.0) or 0.0)
+            low_bat = _is_low_battery(tel)
+            no_tel = _has_no_telemetry(tel)
+
+            # Device qualifies for GPU if clean GPU detected and meets min_vram_mb
+            # Devices with gpu_score == 0 or vram_mb == 0 are placed at least priority
+            qualifies = (gscore > 0.0 and vram > 0 and vram >= min_vram_mb and not no_tel)
+            entry = (addr, tel, low_bat, no_tel, gscore, vram)
+            if qualifies:
+                gpu_capable.append(entry)
+            else:
+                gpu_lacking.append(entry)
+
+        # Sort GPU-capable: high priority
+        # low_battery (0 or 1), then -gpu_score, then -vram, then -multi_core
+        gpu_capable.sort(key=lambda x: (
+            1 if x[2] else 0,                                 # battery penalty
+            -(x[4]),                                          # gpu_score desc
+            -(x[5]),                                          # vram_mb desc
+            -float(x[1].get("multi_core_score", 0.0) or 0.0), # cpu tie-break
+        ))
+
+        # Sort GPU-lacking: LEAST priority
+        # no_telemetry (0 or 1), low_battery (0 or 1), then -multi_core, then -ram
+        gpu_lacking.sort(key=lambda x: (
+            1 if x[3] else 0,                                 # no-telemetry at absolute bottom
+            1 if x[2] else 0,                                 # battery penalty
+            -float(x[1].get("multi_core_score", 0.0) or 0.0), # best CPU fallback first
+            -int(x[1].get("ram_mb", 0) or 0),
+        ))
+
+        ranked = [x[0] for x in gpu_capable] + [x[0] for x in gpu_lacking]
+        return ranked
+
+    elif rt == "single_core":
+        def _sc_key(addr: str):
+            tel = _get_telemetry(addr)
+            low_bat = _is_low_battery(tel)
+            no_tel = _has_no_telemetry(tel)
+            sc_score = float(tel.get("single_core_score", 0.0) or 0.0)
+            mc_score = float(tel.get("multi_core_score", 0.0) or 0.0)
+            return (
+                1 if no_tel else 0,
+                1 if low_bat else 0,
+                -sc_score,
+                -mc_score,
+            )
+        sorted_candidates = sorted(candidates, key=_sc_key)
+        return sorted_candidates
+
+    else:  # multi_core / auto / cpu / default
+        def _mc_key(addr: str):
+            tel = _get_telemetry(addr)
+            low_bat = _is_low_battery(tel)
+            no_tel = _has_no_telemetry(tel)
+            mc_score = float(tel.get("multi_core_score", 0.0) or 0.0)
+            sc_score = float(tel.get("single_core_score", 0.0) or 0.0)
+            cores = int(tel.get("cpu_count", 1) or 1)
+            return (
+                1 if no_tel else 0,
+                1 if low_bat else 0,
+                -mc_score,
+                -sc_score,
+                -cores,
+            )
+        sorted_candidates = sorted(candidates, key=_mc_key)
+        return sorted_candidates
 
 # ==============================================================================
 # SUBPROCESS ENTRY POINT FOR STANDALONE FILE-TRANSFER DAEMON

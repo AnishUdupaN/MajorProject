@@ -1640,12 +1640,9 @@ def run_master() -> None:
             with worker_pool.lock:
                 telemetry = dict(worker_pool.worker_telemetry)
             
-            ranked = rank_workers_by_affinity(telemetry, config.resource_type, config.min_vram_mb)
-            sorted_addresses = [ip for ip in ranked if ip in worker_addresses_to_use]
-            for ip in worker_addresses_to_use:
-                if ip not in sorted_addresses:
-                    sorted_addresses.append(ip)
-            worker_addresses_to_use = sorted_addresses
+            worker_addresses_to_use = rank_workers_by_affinity(
+                telemetry, config.resource_type, config.min_vram_mb, worker_addresses=worker_addresses_to_use
+            )
 
             try:
                 validate_worker_address_count(worker_addresses_to_use, config.min_devices)
@@ -1660,6 +1657,77 @@ def run_master() -> None:
                 print(f"Spare nodes ({len(spare_nodes)}): {', '.join(spare_nodes)}")
             else:
                 print("Spare nodes: None")
+
+            # Check if there are no spare nodes left and prompt user for confirmation
+            if not spare_nodes:
+                warning_msg = (
+                    f"WARNING: Total {len(worker_addresses_to_use)} device(s) connected, task requires at least "
+                    f"{config.min_devices}. All {len(active_nodes)} node(s) allocated as active, but NO spare nodes are left for failover!"
+                )
+                printlog(f"\n[SPARE NODES WARNING] {warning_msg}")
+                if dashboard:
+                    dashboard.add_message(warning_msg, timeout_seconds=60)
+
+                prompt_text = (
+                    f"\n======================================================================\n"
+                    f"  WARNING: NO SPARE NODES AVAILABLE FOR FAILOVER RECOVERY\n"
+                    f"======================================================================\n"
+                    f"Total connected devices: {len(worker_addresses_to_use)}\n"
+                    f"Task minimum required:   {config.min_devices}\n"
+                    f"Active nodes allocated:  {len(active_nodes)}\n"
+                    f"Spare nodes available:   0 (None)\n\n"
+                    f"If an active worker node fails during execution, automatic failover\n"
+                    f"will NOT be possible without waiting or user intervention.\n"
+                    f"Do you want to continue without spare nodes? [y/N]: "
+                )
+                if dashboard:
+                    dashboard.set_prompt(prompt_text)
+                else:
+                    sys.stdout.write(prompt_text)
+                    sys.stdout.flush()
+
+                confirmed = False
+                if dashboard and getattr(dashboard, "webserver_mode", False):
+                    dashboard.pending_input_event.clear()
+                    dashboard.pending_input_event.wait()
+                    ans = dashboard.pending_input_answer
+                    dashboard.pending_input_answer = None
+                    confirmed = (ans == "confirm")
+                elif sys.stdin.isatty():
+                    try:
+                        import termios, tty as _tty
+                        fd = sys.stdin.fileno()
+                        old = termios.tcgetattr(fd)
+                        _tty.setcbreak(fd)
+                        try:
+                            char = sys.stdin.read(1).lower()
+                            print(char)
+                            confirmed = (char == "y")
+                        finally:
+                            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                    except Exception:
+                        line = sys.stdin.readline().strip().lower()
+                        confirmed = line.startswith("y")
+                else:
+                    try:
+                        line = sys.stdin.readline().strip().lower()
+                        confirmed = line.startswith("y")
+                    except Exception:
+                        confirmed = False
+
+                if dashboard:
+                    dashboard.set_prompt(None)
+
+                if not confirmed:
+                    print("\nUser declined to continue without spare nodes. Exiting safely...")
+                    printlog("[SPARE NODES] User declined execution with 0 spare nodes. Exiting.")
+                    if dashboard:
+                        dashboard.add_message("Execution aborted: no spare nodes.", timeout_seconds=10)
+                    worker_pool.shutdown_all_workers()
+                    sys.exit(0)
+
+                print("User confirmed: proceeding without spare nodes.")
+                printlog("[SPARE NODES] User confirmed proceeding without spare nodes.")
 
             dashboard.total_parts = len(active_nodes)
             dashboard.reset_nodes()
