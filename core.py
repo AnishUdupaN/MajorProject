@@ -3,6 +3,8 @@ Consolidates constants, config loading, device mapping, networking, control mess
 HTTP file transfers, task execution monitoring, video splitting/merging, and UI dashboard.
 """
 
+from __future__ import annotations
+
 import argparse
 import atexit
 import configparser

@@ -4,6 +4,9 @@
 3. Affinity priority ranking for GPU, single-core, multi-core/auto, low-battery, and zero-GPU devices.
 4. Spare nodes detection and warning logic.
 """
+
+from __future__ import annotations
+
 import json
 import os
 import tempfile

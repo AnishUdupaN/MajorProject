@@ -1,4 +1,5 @@
 """Quick smoke-test for StatusDashboard TUI fixes."""
+from __future__ import annotations
 import time
 import sys
 

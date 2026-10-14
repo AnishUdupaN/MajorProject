@@ -1,5 +1,7 @@
 """Phase 6.2 Demo Script: Failover demonstration for distributed video processing."""
 
+from __future__ import annotations
+
 import json
 import os
 import shutil

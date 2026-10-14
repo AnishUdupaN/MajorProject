@@ -1,5 +1,7 @@
 """Master node entry point: load config, validate addresses, split video, distribute parts, track execution with same-node retries & dynamic pooling, collect results, and merge."""
 
+from __future__ import annotations
+
 import argparse
 import select
 import signal

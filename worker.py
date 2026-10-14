@@ -1,5 +1,7 @@
 """Worker node entry point: connect to master, download part file, execute task, and send finished signal."""
 
+from __future__ import annotations
+
 import argparse
 import signal
 import socket

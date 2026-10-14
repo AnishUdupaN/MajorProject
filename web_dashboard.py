@@ -1,5 +1,7 @@
 """Web dashboard for the master node — serves a live status page and accepts user input."""
 
+from __future__ import annotations
+
 import json
 import time
 import threading
