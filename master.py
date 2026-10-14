@@ -146,7 +146,7 @@ class WorkerConnectionPool:
                     paired = False
                     while attempts_left > 0:
                         try:
-                            conn.settimeout(120.0)  # Generous 2-minute window to enter PIN
+                            conn.settimeout(300.0)  # 300-second window to enter PIN
                             resp = receive_pin_response(conn)
                             conn.settimeout(None)
                             if resp["pin"] == self.session_pin:
@@ -322,7 +322,7 @@ class WorkerConnectionPool:
 def parse_master_arguments() -> argparse.Namespace:
     """Parse CLI arguments for master startup with optional list of worker IP addresses."""
     parser = argparse.ArgumentParser(
-        description="Start the master node for distributed video processing."
+        description="Start the master node for distributed processing."
     )
     parser.add_argument(
         "--config",
@@ -333,11 +333,6 @@ def parse_master_arguments() -> argparse.Namespace:
         "--master-ip",
         default=None,
         help="IP address workers should use to reach this master (auto-detected if omitted)",
-    )
-    parser.add_argument(
-        "--input-video",
-        default=None,
-        help="Path to input video file (default: auto-detected from split_command or master/input/)",
     )
     parser.add_argument(
         "--password",
@@ -506,7 +501,7 @@ def handle_no_spare_nodes_recovery(
     while True:
         if dashboard:
             dashboard.add_message(
-                f"ALERT: Node {failed_ip} failed! No spare nodes. Press 'k' to kill, 'w' to wait 1m, 'r' to reassign, 'b' for both.",
+                f"ALERT: Node {failed_ip} failed! No spare nodes. Press 'k' to kill, 'w' to wait 2m, 'r' to reassign, 'b' for both.",
                 timeout_seconds=60,
             )
 
@@ -517,9 +512,9 @@ def handle_no_spare_nodes_recovery(
             "One of the active devices has failed and no spare nodes are connected.\n"
             "Options:\n"
             "  [k] Kill task: Safely terminate running tasks on healthy nodes and exit.\n"
-            "  [w] Wait 1 minute: Keep healthy nodes running and wait for a new node to connect.\n"
+            "  [w] Wait 2 minutes: Keep healthy nodes running and wait for a new node to connect.\n"
             "  [r] Reassign when finished: Wait until a healthy node finishes its task and reassign this task to it.\n"
-            "  [b] Both: Listen for new nodes for 60s; if none found, fallback to reassigning to first finished node.\n"
+            "  [b] Both: Listen for new nodes for 2 minutes; if none found, fallback to reassigning to first finished node.\n"
             "Enter choice (k/w/r/b): "
         )
         if dashboard:
@@ -586,10 +581,10 @@ def handle_no_spare_nodes_recovery(
             raise RuntimeError("Task execution killed by user due to node failure and lack of recovery nodes.")
 
         elif choice == "w":
-            print("\nUser selected to WAIT. Waiting up to 60 seconds for a new node to connect...")
-            printlog(f"\nUser selected 'w' (wait 60s) after failure of node {failed_ip}.")
+            print("\nUser selected to WAIT. Waiting up to 2 minutes for a new node to connect...")
+            printlog(f"\nUser selected 'w' (wait 2m) after failure of node {failed_ip}.")
             wait_start = time.time()
-            wait_timeout = 60.0
+            wait_timeout = 120.0
             found_spare_ip = None
 
             while time.time() - wait_start < wait_timeout:
@@ -766,11 +761,11 @@ def handle_no_spare_nodes_recovery(
                 return reassigned_ip, reassigned_conn, daemon
 
         elif choice == "b":
-            print("\nUser selected BOTH. Listening up to 60s for new nodes or waiting for healthy node to finish...")
+            print("\nUser selected BOTH. Listening up to 2 minutes for new nodes or waiting for healthy node to finish...")
             printlog(f"\nUser selected 'b' (both) after failure of node {failed_ip}.")
 
             wait_start = time.time()
-            wait_timeout = 60.0
+            wait_timeout = 120.0
             found_spare_ip = None
             reassigned_ip = None
 
@@ -1462,7 +1457,6 @@ def run_master() -> None:
         cleanup_master_temporary_files(
             parts_directory=arguments.parts_directory,
             output_directory=MASTER_OUTPUT_DIRECTORY,
-            input_video=arguments.input_video,
         )
         sys.exit(128 + signum)
 
@@ -1555,7 +1549,7 @@ def run_master() -> None:
                 # Device Discovery Phase on Dashboard
                 dashboard.set_master_state("device discovery")
                 start_time = time.time()
-                timeout_seconds = 60.0
+                timeout_seconds = 300.0
                 deadline = start_time + timeout_seconds
 
                 fd = None
@@ -1578,8 +1572,9 @@ def run_master() -> None:
                         with worker_pool.lock:
                             connected_ips = list(worker_pool.connections.keys())
 
+                        remaining_str = f" ({remaining}s remaining)" if remaining < 30 else ""
                         dashboard.set_prompt(
-                            f"Discovered {len(connected_ips)} worker(s). Config: '{selected_config_path}'.\nPress 'y' to continue, 'q' to quit ({remaining}s remaining): "
+                            f"Discovered {len(connected_ips)} worker(s). Config: '{selected_config_path}'.\nPress 'y' to continue, 'q' to quit{remaining_str}: "
                         )
 
                         if getattr(dashboard, "webserver_mode", False):
@@ -1761,7 +1756,7 @@ def run_master() -> None:
 
             dashboard.set_master_state("splitting file")
             run_split_command(
-                config.split_command, len(active_nodes), input_video=arguments.input_video, parts_directory=arguments.parts_directory
+                config.split_command, len(active_nodes), parts_directory=arguments.parts_directory
             )
             verify_part_files(
                 len(active_nodes), parts_directory=arguments.parts_directory, split_command=config.split_command
@@ -1851,7 +1846,6 @@ def run_master() -> None:
         cleanup_master_temporary_files(
             parts_directory=arguments.parts_directory,
             output_directory=MASTER_OUTPUT_DIRECTORY,
-            input_video=arguments.input_video,
         )
 
 if __name__ == "__main__":

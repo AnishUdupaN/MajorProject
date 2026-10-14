@@ -2613,7 +2613,7 @@ def _get_total_ram_mb() -> int:
             pass
     return 0
 
-def run_node_benchmark() -> dict:
+def run_node_benchmark(custom_username: str | None = None) -> dict:
     """Run hardware benchmark binary (persistent cache) and return telemetry dict.
 
     On first run: executes ./binaries/benchmark/<os>/bench, parses JSON output,
@@ -2627,10 +2627,13 @@ def run_node_benchmark() -> dict:
     # --- helpers ---
     power = detect_power_state()
     gpu_info = detect_gpu_info()
-    try:
-        username = getpass.getuser()
-    except Exception:
-        username = "unknown"
+    if custom_username:
+        username = custom_username
+    else:
+        try:
+            username = getpass.getuser()
+        except Exception:
+            username = "unknown"
     hostname_str = socket.gethostname()
     os_type_str = platform.system().lower()
     cpu_count_val = os.cpu_count() or 1

@@ -54,12 +54,17 @@ from core import (
 def parse_worker_arguments() -> argparse.Namespace:
     """Parse CLI arguments for worker startup with optional master IP address and flags."""
     parser = argparse.ArgumentParser(
-        description="Start a worker node for distributed video processing."
+        description="Start a worker node for distributed processing."
     )
     parser.add_argument(
         "--config",
         default=None,
         help="Path to the config file (default: auto-discovered from config/ directory)",
+    )
+    parser.add_argument(
+        "--username",
+        default=None,
+        help="Custom username to display on master dashboard (overrides system username)",
     )
     parser.add_argument(
         "--password",
@@ -440,19 +445,30 @@ def run_worker() -> None:
                         
                         resp = receive_json_message(connection)
                         if resp.get("type") == MESSAGE_TYPE_PIN_REJECTED:
-                            print(f"Pairing rejected: {resp.get('reason')}. Retrying...", file=sys.stderr)
-                            cached_pin = arguments.password  # Reset to arg if present, else None
-                            connection.close()
-                            connection = None
-                            active_conn_ref[0] = None
-                            continue
+                            reason = resp.get("reason", "Invalid PIN/Password")
+                            if arguments.password is not None:
+                                print(f"Wrong password: {reason}. Exiting.", file=sys.stderr)
+                                try:
+                                    connection.close()
+                                except Exception:
+                                    pass
+                                connection = None
+                                active_conn_ref[0] = None
+                                sys.exit(1)
+                            else:
+                                print(f"Pairing rejected: {reason}. Retrying...", file=sys.stderr)
+                                cached_pin = None
+                                connection.close()
+                                connection = None
+                                active_conn_ref[0] = None
+                                continue
                         elif resp.get("type") != MESSAGE_TYPE_PIN_ACCEPTED:
                             print(f"Unexpected response during PIN pairing: {resp}", file=sys.stderr)
                             sys.exit(1)
                             
                     # Run hardware benchmark (~2 seconds)
                     print("Running hardware benchmarks...")
-                    telemetry = run_node_benchmark()
+                    telemetry = run_node_benchmark(custom_username=arguments.username)
                     send_worker_telemetry(connection, telemetry)
 
                     # Phase 0: Perform binary handshake
