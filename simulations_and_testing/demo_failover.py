@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
 
 from core import DEVICES_JSON_FILE
@@ -42,6 +42,7 @@ def run_failover_demo() -> None:
         "execute_command = python3 -c \"import shutil, time; time.sleep(1.5); shutil.copy('{input}', '{output_directory}/{output}')\"\n"
         "merge_command = python3 -c \"import shutil; shutil.copy('{output_directory}/part1.mkv', '{output_directory}/output.mkv')\"\n"
         "max_nodes = 2\n"
+        "min_nodes = 2\n"
     )
 
     # Reset devices.json
@@ -60,25 +61,29 @@ def run_failover_demo() -> None:
     print("[STEP 1] Launching Master Node...")
     master_cmd = [
         sys.executable,
-        str(PROJECT_DIR / "master.py"),
+        str(PROJECT_DIR / "master" / "master.py"),
         "--config",
         str(demo_config),
+        "--password",
+        "demo123",
         active_ip1,
         active_ip2,
         spare_ip,
     ]
-    master_proc = subprocess.Popen(master_cmd, cwd=PROJECT_DIR)
+    master_proc = subprocess.Popen(master_cmd, cwd=PROJECT_DIR, stdin=subprocess.PIPE)
     time.sleep(1.5)
 
     # 4. Start Worker 1 (127.0.0.1)
     print("[STEP 2] Launching Worker 1 (127.0.0.1)...")
     worker1_cmd = [
         sys.executable,
-        str(PROJECT_DIR / "worker.py"),
+        str(PROJECT_DIR / "worker" / "worker.py"),
         "--config",
         str(demo_config),
         "--bind-ip",
         active_ip1,
+        "--password",
+        "demo123",
         active_ip1,
     ]
     worker1_proc = subprocess.Popen(worker1_cmd, cwd=PROJECT_DIR)
@@ -87,13 +92,15 @@ def run_failover_demo() -> None:
     print("[STEP 3] Launching Worker 2 (127.0.0.2) with simulated failure after 0.5s...")
     worker2_cmd = [
         sys.executable,
-        str(PROJECT_DIR / "worker.py"),
+        str(PROJECT_DIR / "worker" / "worker.py"),
         "--config",
         str(demo_config),
         "--bind-ip",
         active_ip2,
         "--simulate-failure-after",
         "0.5",
+        "--password",
+        "demo123",
         active_ip1,
     ]
     worker2_proc = subprocess.Popen(worker2_cmd, cwd=PROJECT_DIR)
@@ -105,16 +112,22 @@ def run_failover_demo() -> None:
     print("\n[STEP 4] Launching Spare Worker (127.0.0.3) to take over node2...")
     spare_cmd = [
         sys.executable,
-        str(PROJECT_DIR / "worker.py"),
+        str(PROJECT_DIR / "worker" / "worker.py"),
         "--config",
         str(demo_config),
         "--bind-ip",
         spare_ip,
+        "--password",
+        "demo123",
         active_ip1,
     ]
     spare_proc = subprocess.Popen(spare_cmd, cwd=PROJECT_DIR)
 
-    master_code = master_proc.wait(timeout=30)
+    try:
+        master_proc.communicate(input=b"n\n", timeout=30)
+    except subprocess.TimeoutExpired:
+        master_proc.kill()
+    master_code = master_proc.returncode
     for p in [worker1_proc, worker2_proc, spare_proc]:
         if p and p.poll() is None:
             p.terminate()

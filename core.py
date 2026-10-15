@@ -190,6 +190,20 @@ def compute_md5(filepath: str | Path) -> str:
     return h.hexdigest()
 
 
+def get_binary_base_dir(
+    binaries_directory: str = "binaries",
+    binary_name: str = "",
+    os_folder: str = "",
+) -> Path:
+    """Resolve base directory for a binary on the master node: ./binaries/<binary_name>/<os_name>/"""
+    base_dirs = [Path(binaries_directory), Path(__file__).resolve().parent / binaries_directory]
+    for b_dir in base_dirs:
+        candidate = b_dir / binary_name / os_folder
+        if candidate.is_dir():
+            return candidate
+    return Path(binaries_directory) / binary_name / os_folder
+
+
 def get_binary_path(
     binaries_directory: str,
     os_folder: str,
@@ -198,30 +212,43 @@ def get_binary_path(
 ) -> Path | None:
     """Return the Path to the binary for the given OS/arch, or None if not found.
 
-    Supports layout:
-      <binaries_directory>/<binary_name>/<os_folder>/<binary_name>
-    as well as fallback legacy layout:
-      <binaries_directory>/<os_folder>/<arch_folder>/<binary_name>
+    Resolves to ./binaries/<binary_name>/<os_folder>/
     """
-    # Primary directory layout: binaries/<binary_name>/<os_folder>/<binary_name>
-    primary = Path(binaries_directory) / binary_name / os_folder / binary_name
-    if primary.is_file():
-        return primary
+    base_dirs = [Path(binaries_directory), Path(__file__).resolve().parent / binaries_directory]
+    for b_dir in base_dirs:
+        target_dir = b_dir / binary_name / os_folder
+        if not target_dir.is_dir():
+            continue
 
-    # Secondary check: if there is a directory or executable matching under primary parent
-    primary_dir = Path(binaries_directory) / binary_name / os_folder
-    if primary_dir.is_dir():
-        # Check for executable/file in primary_dir (e.g., blender executable or app)
-        for item in primary_dir.iterdir():
+        # 1. Primary layout: ./binaries/<binary_name>/<os_folder>/<binary_name>
+        primary = target_dir / binary_name
+        if primary.is_file():
+            return primary
+
+        # 2. Python script layout: ./binaries/<binary_name>/<os_folder>/<binary_name>.py
+        script = target_dir / f"{binary_name}.py"
+        if script.is_file():
+            return script
+
+        # 3. Check for any non-hidden file in target_dir
+        for item in sorted(target_dir.iterdir()):
             if item.is_file() and not item.name.startswith("."):
                 return item
 
-    # Legacy fallback: binaries/<os_folder>/<arch_folder>/<binary_name>
-    legacy = Path(binaries_directory) / os_folder / arch_folder / binary_name
-    if legacy.is_file():
-        return legacy
+        # 4. Multi-directory structure (e.g. Blender app bundle)
+        return target_dir
 
     return None
+
+
+def resolve_worker_binary_base_dir(
+    binary_name: str,
+    os_folder: str,
+) -> Path:
+    """Return the base local cache directory for a binary on a worker node: ./worker/binaries/<binary_name>/<os_name>/"""
+    cache_dir = Path(WORKER_BINARY_DIRECTORY) / binary_name / os_folder
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
 
 
 def resolve_worker_binary_cache_path(
@@ -231,12 +258,9 @@ def resolve_worker_binary_cache_path(
 ) -> Path:
     """Return the expected local cache path for a binary on a worker node.
 
-    Path: worker/binaries/<binary_name>/<os_folder>/<binary_name>
-    The directory is created automatically if it doesn't exist.
+    Path: ./worker/binaries/<binary_name>/<os_folder>/<binary_name>
     """
-    cache_dir = Path(WORKER_BINARY_DIRECTORY) / binary_name / os_folder
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / binary_name
+    return resolve_worker_binary_base_dir(binary_name, os_folder) / binary_name
 
 
 # ------ Binary handshake messaging functions ------
@@ -359,13 +383,13 @@ def send_pin_rejected(connection: socket.socket, reason: str, attempts_left: int
 # SECTION 2: CONFIGURATION LOADER
 # ==============================================================================
 
-@dataclass(frozen=True)
+@dataclass
 class Config:
     split_command: str
     execute_command: str
     merge_command: str
     max_nodes: int
-    min_devices: int = 2
+    min_nodes: int = 1
     on_high_usage: str = "kill"
     long_runnable: bool = False
     cpu_threshold_percent: float = 20.0
@@ -373,7 +397,7 @@ class Config:
     nice_initial: int = 5
     nice_step: int = 5
     nice_max: int = 19
-    nice_check_interval_seconds: float = 60.0
+    nice_check_interval_seconds: float = 5.0
     max_throttle_duration_seconds: float = 600.0
     unthrottle_threshold_seconds: float = 20.0
     # Binary distribution settings
@@ -382,14 +406,15 @@ class Config:
     require_binary: bool = False
     resource_type: str = "auto"
     min_vram_mb: int = 0
-    # OS-specific command overrides for bare-metal execution
-    split_command_windows: str = ""
+
+    @property
+    def min_devices(self) -> int:
+        return self.min_nodes
+    # Platform-specific command overrides
     split_command_macos: str = ""
     split_command_linux: str = ""
-    execute_command_windows: str = ""
     execute_command_macos: str = ""
     execute_command_linux: str = ""
-    merge_command_windows: str = ""
     merge_command_macos: str = ""
     merge_command_linux: str = ""
 
@@ -399,9 +424,7 @@ class Config:
             os_type = platform.system().lower()
         else:
             os_type = os_type.lower()
-        if ("win" in os_type) and self.execute_command_windows:
-            return self.execute_command_windows
-        elif ("darwin" in os_type or "mac" in os_type) and self.execute_command_macos:
+        if ("darwin" in os_type or "mac" in os_type) and self.execute_command_macos:
             return self.execute_command_macos
         elif ("linux" in os_type) and self.execute_command_linux:
             return self.execute_command_linux
@@ -413,9 +436,7 @@ class Config:
             os_type = platform.system().lower()
         else:
             os_type = os_type.lower()
-        if ("win" in os_type) and self.split_command_windows:
-            return self.split_command_windows
-        elif ("darwin" in os_type or "mac" in os_type) and self.split_command_macos:
+        if ("darwin" in os_type or "mac" in os_type) and self.split_command_macos:
             return self.split_command_macos
         elif ("linux" in os_type) and self.split_command_linux:
             return self.split_command_linux
@@ -427,9 +448,7 @@ class Config:
             os_type = platform.system().lower()
         else:
             os_type = os_type.lower()
-        if ("win" in os_type) and self.merge_command_windows:
-            return self.merge_command_windows
-        elif ("darwin" in os_type or "mac" in os_type) and self.merge_command_macos:
+        if ("darwin" in os_type or "mac" in os_type) and self.merge_command_macos:
             return self.merge_command_macos
         elif ("linux" in os_type) and self.merge_command_linux:
             return self.merge_command_linux
@@ -450,16 +469,16 @@ def get_available_configs(base_dir: str | Path = ".") -> list[str]:
     base_path = Path(base_dir).resolve()
     configs = []
 
-    # Check config/ directory first
-    config_dir = base_path / "config"
-    if config_dir.is_dir():
-        for file in sorted(config_dir.glob("*.ini")):
-            try:
-                rel_path = str(file.relative_to(base_path))
-            except ValueError:
-                rel_path = file.name
-            if rel_path not in configs:
-                configs.append(rel_path)
+    # Check config/ directory (under base_path and project root)
+    for c_dir in [base_path / "config", Path(__file__).resolve().parent / "config"]:
+        if c_dir.is_dir():
+            for file in sorted(c_dir.glob("*.ini")):
+                try:
+                    rel_path = str(file.relative_to(base_path))
+                except ValueError:
+                    rel_path = str(file)
+                if rel_path not in configs:
+                    configs.append(rel_path)
 
     # Check root config.ini if it exists
     root_ini = base_path / "config.ini"
@@ -504,7 +523,7 @@ def load_config(config_path: str) -> Config:
     if max_nodes < 1:
         raise ValueError(f"max_nodes must be a positive integer, got {max_nodes}")
 
-    min_devices = section.getint("min_devices", fallback=max_nodes)
+    min_nodes = section.getint("min_nodes", fallback=section.getint("min_devices", fallback=1))
 
     on_high_usage = section.get("on_high_usage", "kill").strip().lower()
     if on_high_usage not in ("kill", "throttle"):
@@ -515,7 +534,7 @@ def load_config(config_path: str) -> Config:
         execute_command=section[CONFIG_KEY_EXECUTE_COMMAND].strip(),
         merge_command=section[CONFIG_KEY_MERGE_COMMAND].strip(),
         max_nodes=max_nodes,
-        min_devices=min_devices,
+        min_nodes=min_nodes,
         on_high_usage=on_high_usage,
         long_runnable=section.getboolean("long_runnable", fallback=False),
         cpu_threshold_percent=section.getfloat("cpu_threshold_percent", fallback=20.0),
@@ -523,7 +542,7 @@ def load_config(config_path: str) -> Config:
         nice_initial=section.getint("nice_initial", fallback=5),
         nice_step=section.getint("nice_step", fallback=5),
         nice_max=section.getint("nice_max", fallback=19),
-        nice_check_interval_seconds=section.getfloat("nice_check_interval_seconds", fallback=60.0),
+        nice_check_interval_seconds=section.getfloat("nice_check_interval_seconds", fallback=5.0),
         max_throttle_duration_seconds=section.getfloat("max_throttle_duration_seconds", fallback=600.0),
         unthrottle_threshold_seconds=section.getfloat("unthrottle_threshold_seconds", fallback=20.0),
         binary_name=section.get("binary_name", "").strip(),
@@ -531,13 +550,10 @@ def load_config(config_path: str) -> Config:
         require_binary=section.getboolean("require_binary", fallback=False),
         resource_type=section.get("resource_type", "auto").strip().lower(),
         min_vram_mb=section.getint("min_vram_mb", fallback=0),
-        split_command_windows=section.get("split_command_windows", "").strip(),
         split_command_macos=section.get("split_command_macos", "").strip(),
         split_command_linux=section.get("split_command_linux", "").strip(),
-        execute_command_windows=section.get("execute_command_windows", "").strip(),
         execute_command_macos=section.get("execute_command_macos", "").strip(),
         execute_command_linux=section.get("execute_command_linux", "").strip(),
-        merge_command_windows=section.get("merge_command_windows", "").strip(),
         merge_command_macos=section.get("merge_command_macos", "").strip(),
         merge_command_linux=section.get("merge_command_linux", "").strip(),
     )
@@ -1585,10 +1601,25 @@ def run_execute_command(
     process_env = os.environ.copy()
     try:
         os_folder, arch_folder = get_worker_platform()
-        # Extract binary name from template (usually the first word)
-        binary_name = command_args[0] if command_args else "ffmpeg"
-        bin_dir = str(resolve_worker_binary_cache_path(os_folder, arch_folder, binary_name).parent.resolve())
-        process_env["PATH"] = f"{bin_dir}{os.pathsep}{process_env.get('PATH', '')}"
+        # Binary resolver resolves base dir: ./worker/binaries/<binary_name>/<os_name>/
+        binary_name = (config.binary_name if config and config.binary_name else (command_args[0] if command_args else ""))
+        if binary_name:
+            worker_bin_dir = resolve_worker_binary_base_dir(binary_name, os_folder)
+            bin_dirs = [worker_bin_dir]
+            if config and getattr(config, "binaries_directory", None):
+                bin_dirs.append(get_binary_base_dir(config.binaries_directory, binary_name, os_folder))
+            else:
+                bin_dirs.append(get_binary_base_dir("binaries", binary_name, os_folder))
+
+            for base_bin_dir in bin_dirs:
+                if base_bin_dir.is_dir():
+                    process_env["PATH"] = f"{base_bin_dir.resolve()}{os.pathsep}{process_env.get('PATH', '')}"
+                    if command_args:
+                        sub_candidate = base_bin_dir / command_args[0]
+                        if sub_candidate.is_file():
+                            ensure_executable(sub_candidate)
+                            command_args[0] = str(sub_candidate.resolve())
+                            break
     except Exception:
         pass
 

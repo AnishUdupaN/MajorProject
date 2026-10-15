@@ -16,3 +16,6 @@ new-idea.txt
 config.ini
 devices.json
 logs.txt
+benchmark.json
+benchmark_results.json
+scores.json

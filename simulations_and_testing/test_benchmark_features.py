@@ -9,15 +9,23 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from core import (
     validate_message,
     MESSAGE_TYPE_WORKER_TELEMETRY,
     rank_workers_by_affinity,
     run_node_benchmark,
 )
-from master import split_active_and_spare_addresses
+try:
+    from master.master import split_active_and_spare_addresses
+except ImportError:
+    from master import split_active_and_spare_addresses
 
 def test_telemetry_schema():
     print("--- Test 1: Telemetry Message Schema ---")
@@ -45,10 +53,12 @@ def test_telemetry_schema():
         print(f"✓ Invalid message caught properly: {e}")
 
 def test_benchmark_caching():
-    print("\n--- Test 2: Benchmark Persistence & Caching ---")
-    # Verify benchmark.json exists and has valid values
-    assert Path("benchmark.json").is_file(), "benchmark.json should exist"
-    with open("benchmark.json") as f:
+    cache_file = PROJECT_ROOT / "benchmark.json"
+    if not cache_file.is_file():
+        print("Generating benchmark cache on first test run...")
+        run_node_benchmark()
+    assert cache_file.is_file(), f"{cache_file} should exist"
+    with open(cache_file) as f:
         data = json.load(f)
     print("Loaded benchmark.json:", data)
     assert "single_core_score" in data
@@ -162,7 +172,7 @@ def test_spare_nodes_split():
     # "there are total 3 devices. task requires atleast 3. no spare nodes left."
     devices = ["node1", "node2", "node3"]
     max_nodes = 3
-    min_devices = 3
+    min_nodes = 3
 
     active, spares = split_active_and_spare_addresses(devices, max_nodes)
     print(f"Active: {active}, Spares: {spares}")
