@@ -3,8 +3,10 @@ __pycache__
 new
 .old
 filelist.txt
-master
-worker
+master/input
+master/output
+worker/input
+worker/output
 idea.txt
 .tasks.txt
 binaries
