@@ -279,42 +279,82 @@ Passing `--webserver` when starting `master.py` opens a browser dashboard at `ht
 ## Project Structure
 
 ```
-├── core.py                               # Shared networking, protocols, and terminal UI
-├── requirements.txt                      # Dependencies (psutil)
-├── config/                               # Sample task configurations (.ini)
-│   ├── sample_compress_and_grayscale.ini
-│   ├── sample_heavy_blur_effect.ini
-│   ├── sample_invert_colors.ini
-│   ├── sample_ffmpeg_transcode_hevc.ini
-│   ├── sample_ffmpeg_denoising_nlmeans.ini
-│   ├── sample_ffmpeg_audio_ebur128.ini
-│   ├── sample_blender_cycles_render.ini
-│   ├── sample_imagemagick_batch_resize.ini
-│   ├── sample_audio_transcription_whisper.ini
-│   └── sample_parallel_compression_zstd.ini
-├── binaries/
-│   ├── benchmark/                        # Native compiled benchmark binaries
-│   │   ├── linux/bench
-│   │   └── macos/bench
-│   ├── blender/                          # Portable Blender packages
-│   │   ├── linux/blender
-│   │   └── macos/MacOS/Blender
-│   └── ffmpeg/                           # Static ffmpeg binaries
-│       ├── linux/ffmpeg
-│       └── macos/ffmpeg
-├── master/
-│   ├── master.py                         # Master node orchestrator
+├── core/                                 # Shared foundation package
+│   ├── __init__.py                       # Re-exports all public APIs for backwards compatibility
+│   ├── constants.py                      # Network ports, status strings, schemas, and paths
+│   ├── config.py                         # Config dataclass, INI auto-discovery, and parser
+│   ├── devices.py                        # Device ID allocation and devices.json tracking
+│   ├── binaries.py                       # Platform resolution, cache path builder, MD5 hashing
+│   ├── messaging.py                      # TCP JSON protocol, authentication, PIN pairing
+│   ├── discovery.py                      # mDNS auto-discovery and UDP broadcast beacons
+│   ├── file_transfer.py                  # HTTP FileTransferDaemon & upload/download client
+│   ├── benchmark.py                      # Hardware detection, benchmarks, affinity ranking
+│   ├── execution.py                      # Process execution, CPU tracker, and nice throttling
+│   ├── task_prep.py                      # Video/file chunk splitting, merging, and cleanup
+│   └── dashboard.py                      # Terminal StatusDashboard UI and thread-safe logger
+├── master/                               # Master orchestrator component
+│   ├── __init__.py                       # Master package exports
+│   ├── master.py                         # Main orchestrator script and lifecycle coordinator
+│   ├── bench_and_sort.py                 # Worker ranking and active/spare partitioning
+│   ├── failsafe.py                       # Failover recovery, spare reassignment, crash handling
+│   ├── connection_pool.py                # WorkerConnectionPool and socket listener
+│   ├── binary_distributor.py             # Pre-task binary checks and HTTP distribution
+│   ├── task_distributor.py               # Part-file distribution and daemon spawning
+│   ├── monitor.py                        # Execution monitoring and artifact collection
+│   ├── cli.py                            # Master argument parsing and validation
 │   ├── web_dashboard.py                  # Web dashboard server
 │   ├── input/                            # Source input files and split chunks
 │   └── output/                           # Finished merged output files
-├── worker/
-│   ├── worker.py                         # Worker execution daemon
+├── worker/                               # Worker execution component
+│   ├── __init__.py                       # Worker package exports
+│   ├── worker.py                         # Main worker loop and execution daemon
+│   ├── cli.py                            # Worker argument parsing
+│   ├── connection.py                     # Master connection, mDNS/UDP discovery, PIN pairing
+│   ├── binary_manager.py                 # Binary cache verification and handshake
+│   ├── task_fetcher.py                   # HTTP part-file downloading
+│   ├── task_executor.py                  # Task runner, CPU throttling, result upload
 │   ├── benchmark.c                       # Native C hardware benchmark source
 │   ├── input/                            # Worker staging directory for chunks
 │   └── output/                           # Processed results ready for upload
-└── simulations_and_testing/
-    ├── demo_failover.py                  # Automated failover & spare simulation
-    └── test_benchmark_features.py        # Telemetry & affinity test suite
+├── config/                               # Sample task configurations (.ini)
+├── binaries/                             # Portable binaries (benchmark, ffmpeg, blender)
+└── simulations_and_testing/              # Automated simulations and unit test suites
 ```
+
+### Component Reference Guide
+
+#### 1. Core Package (`core/`)
+- **[`core/constants.py`](core/constants.py)**: Protocol constants, ports (5000 control, 5353 mDNS, 5005 UDP), progress labels, message types, and validation schemas (`MESSAGE_REQUIRED_KEYS`).
+- **[`core/config.py`](core/config.py)**: Configuration dataclass (`Config`), INI file parser (`load_config`), and config file auto-discovery (`get_available_configs`).
+- **[`core/devices.py`](core/devices.py)**: Active device mapping, `devices.json` persistence (`write_devices_json`), and hot-spare IP substitution (`swap_device_ip`).
+- **[`core/binaries.py`](core/binaries.py)**: Target platform detection (`get_worker_platform`), cache path resolution (`resolve_worker_binary_cache_path`), and fast MD5 chunked hashing (`compute_md5`).
+- **[`core/messaging.py`](core/messaging.py)**: Low-level socket JSON newline framing, HMAC secret verification, PIN challenge/response handlers, and typed control messages (`send_ready_message`, `send_finished_message`).
+- **[`core/discovery.py`](core/discovery.py)**: Multi-threaded mDNS announcer & listener (`MdnsAnnouncer`, `discover_master_ip`), UDP broadcast beacon responder & listener (`discover_master_udp`).
+- **[`core/file_transfer.py`](core/file_transfer.py)**: Standalone HTTP daemon (`FileTransferDaemon`), ephemeral port manager, and worker file client (`request_file_list`, `request_file`, `upload_result_file`).
+- **[`core/benchmark.py`](core/benchmark.py)**: Hardware inspection (CPU brand, OpenCL GPU/VRAM, native battery status, total RAM), synthetic single/multi-core benchmarks (`benchmark_single_core`, `benchmark_multi_core`, `run_node_benchmark`), and affinity ranking (`rank_workers_by_affinity`).
+- **[`core/execution.py`](core/execution.py)**: Bare-metal process execution runner (`run_execute_command`), real-time `ProcessCpuTracker`, stepped dynamic `nice` throttling, ffmpeg progress/ETA parser, and socket connection liveness watchdog.
+- **[`core/task_prep.py`](core/task_prep.py)**: Task file splitting (`build_split_command`, `run_split_command`), part verification (`verify_part_files`), concat demuxer filelist generator (`write_filelist_txt`), output merging (`run_merge_command`), and cleanup routines.
+- **[`core/dashboard.py`](core/dashboard.py)**: Terminal `StatusDashboard` UI, live progress indicators, interactive prompt system, and thread-safe file logging (`printlog`).
+
+#### 2. Master Component (`master/`)
+- **[`master/master.py`](master/master.py)**: Master orchestration entry point (`run_master`). Coordinates startup, config selection, worker discovery, binary check, video splitting, execution tracking, and final output merging.
+- **[`master/bench_and_sort.py`](master/bench_and_sort.py)**: Worker ranking and partitioning (`split_active_and_spare_addresses`, `rank_and_partition_workers`) matching tasks to best hardware.
+- **[`master/failsafe.py`](master/failsafe.py)**: Fault tolerance logic: hot-spare reassignment (`reassign_task_to_spare_node`) and no-spare recovery scenarios (`handle_no_spare_nodes_recovery`).
+- **[`master/connection_pool.py`](master/connection_pool.py)**: Thread-safe `WorkerConnectionPool` managing dynamic worker socket accepts, PIN authentication challenges, and connection health.
+- **[`master/binary_distributor.py`](master/binary_distributor.py)**: Phase 0 binary verification (`check_and_distribute_binaries`) ensuring workers have required binary dependencies before task dispatch.
+- **[`master/task_distributor.py`](master/task_distributor.py)**: Task dispatch (`distribute_part_files_to_active_nodes`), launching per-node HTTP daemons and sending `ready` signals.
+- **[`master/monitor.py`](master/monitor.py)**: Central event loop (`monitor_worker_executions_and_collect_results`) tracking execution progress, handling same-node retries, and verifying artifact uploads.
+- **[`master/cli.py`](master/cli.py)**: Master CLI argument definitions and validation (`parse_master_arguments`, `validate_worker_address_count`).
+- **[`master/web_dashboard.py`](master/web_dashboard.py)**: Optional browser-based dashboard server (`start_web_server`) exposing REST APIs and live web UI on port 8080.
+
+#### 3. Worker Component (`worker/`)
+- **[`worker/worker.py`](worker/worker.py)**: Worker lifecycle daemon (`run_worker`). Handles connection loops, hardware benchmarking, and continuous task execution.
+- **[`worker/cli.py`](worker/cli.py)**: Worker CLI argument parsing (`parse_worker_arguments`).
+- **[`worker/connection.py`](worker/connection.py)**: Auto-discovery via mDNS/UDP, TCP socket connection, and PIN/password handshake pairing (`connect_to_master`, `discover_master_address`, `perform_handshake_authentication`).
+- **[`worker/binary_manager.py`](worker/binary_manager.py)**: Binary cache management, executable permission checks (`ensure_executable`), and binary transfer handshake (`do_binary_handshake`).
+- **[`worker/task_fetcher.py`](worker/task_fetcher.py)**: HTTP download client fetching allocated input parts from the master daemon (`fetch_allocated_part_file`).
+- **[`worker/task_executor.py`](worker/task_executor.py)**: Task execution loop (`run_worker_task`), CPU nice throttling integration, progress reporting, and multi-file artifact uploading.
+
+*(For detailed architectural guidance, token-optimized file navigation, and debugging instructions for AI agents, see **[AGENTS.md](AGENTS.md)**).*
 
 For compiling the benchmark tool and running tests, see **[BUILD.md](BUILD.md)**.
