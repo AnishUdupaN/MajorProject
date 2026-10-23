@@ -25,6 +25,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import namedtuple
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -1479,13 +1480,85 @@ def _stderr_reader_thread(process: subprocess.Popen, state: dict, input_file: st
     process.stderr.close()
 
 
+def get_num_cpus() -> int:
+    """Native replacement for len(os.sched_getaffinity(0)) / os.cpu_count()."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError, ValueError):
+        pass
+    return os.cpu_count() or 1
+
+
+def get_system_cpu_percent(interval: float = 0.1) -> float:
+    """Native replacement for psutil.cpu_percent()."""
+    # --- macOS Implementation ---
+    if sys.platform == "darwin":
+        try:
+            output = subprocess.check_output(
+                ["top", "-l", "1", "-n", "0"], text=True
+            )
+            # Parses line: "CPU usage: 12.34% user, 5.67% sys, 81.99% idle"
+            match = re.search(
+                r"CPU usage:\s*([\d\.]+)%\s*user,\s*([\d\.]+)%\s*sys,\s*([\d\.]+)%\s*idle",
+                output,
+            )
+            if match:
+                user_pct = float(match.group(1))
+                sys_pct = float(match.group(2))
+                return user_pct + sys_pct
+        except Exception:
+            return 0.0
+
+    # --- Linux Implementation ---
+    elif sys.platform.startswith("linux"):
+        try:
+
+            def _read_stat():
+                with open("/proc/stat", "r") as f:
+                    fields = [float(x) for x in f.readline().split()[1:]]
+                idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+                return idle, sum(fields)
+
+            idle1, total1 = _read_stat()
+            time.sleep(interval)
+            idle2, total2 = _read_stat()
+
+            diff_total = total2 - total1
+            if diff_total > 0:
+                diff_idle = idle2 - idle1
+                return (1.0 - (diff_idle / diff_total)) * 100.0
+        except Exception:
+            return 0.0
+
+    return 0.0
+
+
+def get_process_cpu_percent(pid: int, num_cpus: int | None = None) -> float:
+    """Native replacement for: psutil.Process(pid).cpu_percent() / num_cpus"""
+    if num_cpus is None:
+        num_cpus = get_num_cpus()
+
+    try:
+        # `ps -p <pid> -o %cpu=` works on both macOS & Linux.
+        # It outputs CPU usage on a single-core scale (e.g., 200.0 = 2 full cores used).
+        output = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "%cpu="], text=True
+        )
+        raw_cpu_pct = float(output.strip())
+
+        # Divide by core count to normalize to total system capacity (0% - 100%)
+        return raw_cpu_pct / num_cpus
+    except Exception:
+        return 0.0
+
+
 class ProcessCpuTracker:
     """Track system CPU usage and subprocess CPU usage over time."""
 
     def __init__(self, pid: int) -> None:
         self.pid = pid
         self.last_time = time.time()
-        self.num_cpus = os.cpu_count() or 1
+        self.num_cpus = get_num_cpus()
         self._last_sys_ticks = self._read_sys_ticks()
         self._last_proc_ticks = self._read_proc_ticks()
 
@@ -1546,13 +1619,17 @@ class ProcessCpuTracker:
             self._last_proc_ticks = proc_ticks
         else:
             try:
-                import psutil
-                system_cpu_pct = psutil.cpu_percent()
-                p = psutil.Process(self.pid)
-                process_cpu_pct = p.cpu_percent() / self.num_cpus
+                system_cpu_pct = get_system_cpu_percent()
+                process_cpu_pct = get_process_cpu_percent(self.pid, self.num_cpus)
             except Exception:
-                system_cpu_pct = 0.0
-                process_cpu_pct = 0.0
+                try:
+                    import psutil
+                    system_cpu_pct = psutil.cpu_percent()
+                    p = psutil.Process(self.pid)
+                    process_cpu_pct = p.cpu_percent() / self.num_cpus
+                except Exception:
+                    system_cpu_pct = 0.0
+                    process_cpu_pct = 0.0
 
         background_cpu_pct = max(0.0, system_cpu_pct - process_cpu_pct)
         return system_cpu_pct, process_cpu_pct, background_cpu_pct
@@ -1561,20 +1638,28 @@ class ProcessCpuTracker:
 def set_process_nice(pid: int, nice_value: int) -> bool:
     """Set nice priority score for a process PID."""
     try:
-        # On macOS, os.setpriority() may fail silently when raising niceness.
-        # Force fallback to psutil for macOS to ensure it maps correctly.
-        import sys
-        if sys.platform == "darwin":
-            raise OSError("Force psutil fallback on macOS")
         os.setpriority(os.PRIO_PROCESS, pid, nice_value)
         return True
     except Exception:
-        try:
-            import psutil
-            psutil.Process(pid).nice(nice_value)
+        pass
+
+    try:
+        res = subprocess.run(
+            ["renice", str(nice_value), "-p", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if res.returncode == 0:
             return True
-        except Exception:
-            return False
+    except Exception:
+        pass
+
+    try:
+        import psutil
+        psutil.Process(pid).nice(nice_value)
+        return True
+    except Exception:
+        return False
 
 
 def run_execute_command(
@@ -1862,7 +1947,7 @@ def run_execute_command(
                 )
 
 
-            if fd is not None:
+            try:
                 rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
                 if rlist:
                     char = sys.stdin.read(1)
@@ -1871,6 +1956,8 @@ def run_execute_command(
                         print("\n'k' key pressed! Force-killing task process and simulating node drop...")
                         force_stop_process(process)
                         raise KeyboardInterrupt("Task force-killed by user pressing 'k'")
+            except Exception:
+                pass
 
             time.sleep(0.2)
     except Exception:
@@ -2378,12 +2465,6 @@ class StatusDashboard:
             snd = sending if sending is not None else existing.get("sending", False)
             conn = connected if connected is not None else existing.get("connected", True)
 
-            if state in ("disconnected", "killed") and ":" in node_ip:
-                if node_ip in self.node_states:
-                    del self.node_states[node_ip]
-                self._render_unlocked()
-                return
-
             self.node_states[node_ip] = {
                 "node_id": node_id,
                 "filename": filename,
@@ -2543,7 +2624,7 @@ def benchmark_single_core(duration_seconds: float = 0.5) -> float:
     return count / elapsed if elapsed > 0 else 0.0
 
 def benchmark_multi_core(duration_seconds: float = 1.0) -> float:
-    num_cores = os.cpu_count() or 1
+    num_cores = get_num_cpus()
     per_core_duration = max(0.2, duration_seconds / 2)
     try:
         from multiprocessing import Pool
@@ -2637,11 +2718,85 @@ def detect_gpu_info() -> dict:
         pass
     return info
 
+
+def sensors_battery():
+    POWER_TIME_UNKNOWN = -1
+    POWER_TIME_UNLIMITED = -2
+    sbattery = namedtuple("sbattery", ["percent", "secsleft", "power_plugged"])
+
+    if sys.platform == "darwin":
+        try:
+            output = subprocess.check_output(["pmset", "-g", "batt"], text=True)
+            match = re.search(r"(\d+)%;\s*([^;]+);", output)
+            if not match:
+                return None
+            percent = int(match.group(1))
+            status = match.group(2).strip().lower()
+
+            power_plugged = ("ac power" in output.lower() or status in ("charging", "charged", "finishing charge"))
+            time_match = re.search(r"(\d+):(\d+)\s+remaining", output)
+            if power_plugged:
+                secsleft = (POWER_TIME_UNLIMITED if status == "charged" else POWER_TIME_UNKNOWN)
+            elif time_match:
+                hours, mins = map(int, time_match.groups())
+                secsleft = hours * 3600 + mins * 60
+            else:
+                secsleft = POWER_TIME_UNKNOWN
+
+            return sbattery(percent=percent, secsleft=secsleft, power_plugged=power_plugged)
+        except Exception:
+            return None
+
+    elif sys.platform.startswith("linux"):
+        base_path = "/sys/class/power_supply"
+        if not os.path.exists(base_path):
+            return None
+
+        for supply in os.listdir(base_path):
+            if supply.startswith("BAT"):
+                bat_path = os.path.join(base_path, supply)
+                cap_file = os.path.join(bat_path, "capacity")
+                status_file = os.path.join(bat_path, "status")
+                if not os.path.exists(cap_file):
+                    continue
+                with open(cap_file, "r") as f:
+                    percent = int(f.read().strip())
+                status = "unknown"
+                if os.path.exists(status_file):
+                    with open(status_file, "r") as f:
+                        status = f.read().strip().lower()
+                power_plugged = status != "discharging"
+                secsleft = POWER_TIME_UNKNOWN
+                if power_plugged:
+                    if status in ("full", "charged"):
+                        secsleft = POWER_TIME_UNLIMITED
+                else:
+                    time_empty_file = os.path.join(bat_path, "time_to_empty_now")
+                    if os.path.exists(time_empty_file):
+                        try:
+                            with open(time_empty_file, "r") as f:
+                                secsleft = int(f.read().strip())
+                        except ValueError:
+                            pass
+
+                return sbattery(
+                    percent=percent,
+                    secsleft=secsleft,
+                    power_plugged=power_plugged,
+                )
+
+    try:
+        import psutil
+        return psutil.sensors_battery()
+    except Exception:
+        pass
+
+    return None
+
 def detect_power_state() -> dict:
     info = {"is_plugged_in": True, "battery_pct": 100, "has_battery": False}
     try:
-        import psutil
-        battery = psutil.sensors_battery()
+        battery = sensors_battery()
         if battery is not None:
             info["has_battery"] = True
             info["is_plugged_in"] = bool(battery.power_plugged)
@@ -2652,16 +2807,34 @@ def detect_power_state() -> dict:
 
 def _get_total_ram_mb() -> int:
     try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        if page_size > 0 and phys_pages > 0:
+            return (page_size * phys_pages) // (1024 * 1024)
+    except (ValueError, OSError, AttributeError):
+        pass
+
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True)
+            return int(out.strip()) // (1024 * 1024)
+        except Exception:
+            pass
+
+    try:
         import psutil
         return psutil.virtual_memory().total // (1024 * 1024)
     except Exception:
-        try:
-            with open("/proc/meminfo", "r") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        return int(line.split()[1]) // 1024
-        except Exception:
-            pass
+        pass
+
     return 0
 
 def run_node_benchmark(custom_username: str | None = None) -> dict:
@@ -2687,7 +2860,7 @@ def run_node_benchmark(custom_username: str | None = None) -> dict:
             username = "unknown"
     hostname_str = socket.gethostname()
     os_type_str = platform.system().lower()
-    cpu_count_val = os.cpu_count() or 1
+    cpu_count_val = get_num_cpus()
 
     # Cache paths - check standard locations in root and worker directory
     worker_dir = Path(WORKER_DIRECTORY)

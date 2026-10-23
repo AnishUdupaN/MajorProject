@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import socket
 import sys
 import time
+import uuid
 from pathlib import Path
 
 # Ensure project root is in sys.path
@@ -100,6 +102,11 @@ def parse_worker_arguments() -> argparse.Namespace:
         "--bind-ip",
         default=None,
         help="Optional local IP to bind outgoing connection from (useful for multi-node loopback testing)",
+    )
+    parser.add_argument(
+        "--worker-id",
+        default=None,
+        help="Custom persistent worker ID for connection tracking",
     )
     parser.add_argument(
         "--reconnect-timeout",
@@ -423,6 +430,10 @@ def run_worker() -> None:
 
     print(f"Loaded config from {config_path}")
 
+    worker_id = arguments.worker_id
+    if not worker_id:
+        worker_id = f"{arguments.username or 'worker'}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+
     shared_secret = get_shared_secret()
 
     # worker/input holds downloaded parts; worker/output holds processed results.
@@ -537,6 +548,7 @@ def run_worker() -> None:
                     # Run hardware benchmark (~2 seconds)
                     print("Running hardware benchmarks...")
                     telemetry = run_node_benchmark(custom_username=arguments.username)
+                    telemetry["worker_id"] = worker_id
                     send_worker_telemetry(connection, telemetry)
 
                     # Phase 0: Perform binary handshake
