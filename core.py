@@ -1601,25 +1601,43 @@ def run_execute_command(
     process_env = os.environ.copy()
     try:
         os_folder, arch_folder = get_worker_platform()
-        # Binary resolver resolves base dir: ./worker/binaries/<binary_name>/<os_name>/
-        binary_name = (config.binary_name if config and config.binary_name else (command_args[0] if command_args else ""))
-        if binary_name:
-            worker_bin_dir = resolve_worker_binary_base_dir(binary_name, os_folder)
-            bin_dirs = [worker_bin_dir]
-            if config and getattr(config, "binaries_directory", None):
-                bin_dirs.append(get_binary_base_dir(config.binaries_directory, binary_name, os_folder))
-            else:
-                bin_dirs.append(get_binary_base_dir("binaries", binary_name, os_folder))
+        candidate_binaries = []
+        if command_args:
+            first_arg = Path(command_args[0]).name
+            candidate_binaries.append(first_arg)
+            candidate_binaries.append(Path(first_arg).stem)
+        if config and config.binary_name:
+            candidate_binaries.append(config.binary_name)
 
-            for base_bin_dir in bin_dirs:
-                if base_bin_dir.is_dir():
-                    process_env["PATH"] = f"{base_bin_dir.resolve()}{os.pathsep}{process_env.get('PATH', '')}"
-                    if command_args:
-                        sub_candidate = base_bin_dir / command_args[0]
-                        if sub_candidate.is_file():
-                            ensure_executable(sub_candidate)
+        bin_dirs = []
+        for b_name in candidate_binaries:
+            bin_dirs.append(resolve_worker_binary_base_dir(b_name, os_folder))
+            if config and getattr(config, "binaries_directory", None):
+                bin_dirs.append(get_binary_base_dir(config.binaries_directory, b_name, os_folder))
+            else:
+                bin_dirs.append(get_binary_base_dir("binaries", b_name, os_folder))
+
+        # Also search general worker/binaries and binaries directories for the platform
+        for root_b in [Path("worker/binaries"), Path("binaries")]:
+            if root_b.is_dir():
+                for sub in root_b.iterdir():
+                    if sub.is_dir():
+                        os_sub = sub / os_folder
+                        if os_sub.is_dir() and os_sub not in bin_dirs:
+                            bin_dirs.append(os_sub)
+
+        for base_bin_dir in bin_dirs:
+            if base_bin_dir.is_dir():
+                process_env["PATH"] = f"{base_bin_dir.resolve()}{os.pathsep}{process_env.get('PATH', '')}"
+                if command_args:
+                    sub_candidate = base_bin_dir / command_args[0]
+                    if sub_candidate.is_file():
+                        ensure_executable(sub_candidate)
+                        if sub_candidate.suffix == ".py":
+                            command_args = [sys.executable, str(sub_candidate.resolve())] + command_args[1:]
+                        else:
                             command_args[0] = str(sub_candidate.resolve())
-                            break
+                        break
     except Exception:
         pass
 

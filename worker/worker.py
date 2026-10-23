@@ -142,43 +142,28 @@ def ensure_executable(path: Path) -> None:
         sys.exit(1)
 
 
-def do_binary_handshake(
+def handle_binary_handshake_request(
     connection: socket.socket,
     master_ip_address: str,
-    config: "Config",
+    req: dict,
+    config: "Config | None" = None,
 ) -> None:
-    """Phase 0 worker side: respond to master's binary check and fetch binary if needed.
-
-    Steps:
-      1. Receive binary_info_request from master (contains binary_name).
-      2. Detect own platform (os_folder, arch_folder).
-      3. Check local binary cache: worker/binaries/<os>/<arch>/<binary_name>.
-      4. Compute MD5 if the file exists.
-      5. Send binary_info to master (platform, has_binary, md5).
-      6. If master decides to send the binary: receive it via HTTP daemon
-         (master re-uses the existing ready/file_received protocol) and save
-         it to the local cache.
-      7. Wait for binary_ready from master before returning.
-
-    If require_binary is False or binary_name is empty, this function is a no-op.
-    """
-    if not config.binary_name:
-        return
-
-    # Step 1 — receive the request
-    req = receive_binary_info_request(connection)
+    """Handle an incoming binary_info_request from master: check binary cache and fetch if needed."""
+    from core import (
+        receive_json_message,
+        MESSAGE_TYPE_READY,
+        MESSAGE_TYPE_BINARY_READY,
+    )
     binary_name = req["binary_name"]
 
-    # Step 2 — detect platform
     os_folder, arch_folder = get_worker_platform()
 
-    # Step 3 & 4 — check local cache
     cache_path = resolve_worker_binary_cache_path(os_folder, arch_folder, binary_name)
     ensure_executable(cache_path)
     has_binary = cache_path.is_file()
     local_md5 = compute_md5(str(cache_path)) if has_binary else None
 
-    if not has_binary and not config.require_binary:
+    if not has_binary and (config is None or not config.require_binary):
         import shutil
         if shutil.which(binary_name):
             has_binary = True
@@ -186,55 +171,72 @@ def do_binary_handshake(
 
     print(
         f"[BINARY] Platform: {os_folder}/{arch_folder}. "
-        f"Binary '{binary_name}': {'present (MD5=' + local_md5 + ')' if has_binary else 'not found'}."
+        f"Binary '{binary_name}': {'present (MD5=' + str(local_md5) + ')' if has_binary else 'not found'}."
     )
 
-    # Step 5 — tell master
     send_binary_info(connection, os_folder, arch_folder, binary_name, has_binary, local_md5)
 
-    # Step 6 — read master's next decision:
-    #   - MESSAGE_TYPE_BINARY_READY  → master confirmed we're good (skip transfer)
-    #   - MESSAGE_TYPE_READY         → master is sending the binary; fetch it via HTTP daemon
-    from core import receive_json_message, MESSAGE_TYPE_READY, MESSAGE_TYPE_BINARY_READY
     msg = receive_json_message(connection)
 
-    # Master may skip handshake and send ready directly if it reused state
-    if msg.get("type") == MESSAGE_TYPE_READY:
-        print(f"[BINARY] Master skipped handshake. Proceeding directly to task.")
-        return msg
-
     if msg.get("type") == MESSAGE_TYPE_BINARY_READY:
-        # Master confirmed we already have it (or decided not to send)
         print(f"[BINARY] Master acknowledged binary '{binary_name}'. Proceeding.")
         return
 
     if msg.get("type") == MESSAGE_TYPE_READY:
-        # Master is sending the binary — download it like a regular part file
         file_transfer_port = msg["file_transfer_port"]
         master_addr = msg.get("master_ip_address", master_ip_address)
         print(f"[BINARY] Receiving binary '{binary_name}' from master on port {file_transfer_port}...")
         allocated_files = request_file_list(master_addr, file_transfer_port)
         for fname in allocated_files:
             dest = request_file(master_addr, file_transfer_port, fname, str(cache_path.parent))
-            # Rename to the expected binary name if daemon served it under original name
             dest_path = Path(dest)
             expected = cache_path.parent / binary_name
             if dest_path != expected and dest_path.is_file():
                 dest_path.rename(expected)
         send_file_received_message(connection)
         
-        # Make the downloaded binary executable
         if cache_path.is_file():
             ensure_executable(cache_path)
 
         print(f"[BINARY] Binary '{binary_name}' saved to {cache_path}. ✓")
 
-        # Step 7 — wait for binary_ready
         receive_binary_ready(connection)
         print("[BINARY] Binary ready confirmed.")
         return
 
     raise ValueError(f"[BINARY] Unexpected message during binary handshake: {msg!r}")
+
+
+def do_binary_handshake(
+    connection: socket.socket,
+    master_ip_address: str,
+    config: "Config | None" = None,
+) -> dict | None:
+    """Phase 0 worker side: wait for master's initial decision.
+    If master sends binary_info_request, perform binary handshake and return None.
+    If master sends ready directly (binary check skipped), return the ready message.
+    """
+    from core import (
+        receive_json_message,
+        MESSAGE_TYPE_READY,
+        MESSAGE_TYPE_BINARY_INFO_REQUEST,
+        MESSAGE_TYPE_SHUTDOWN,
+        MasterShutdownError,
+    )
+    msg = receive_json_message(connection)
+
+    if msg.get("type") == MESSAGE_TYPE_SHUTDOWN:
+        raise MasterShutdownError("Master sent shutdown signal")
+
+    if msg.get("type") == MESSAGE_TYPE_READY:
+        print("[BINARY] Master skipped binary handshake. Proceeding directly to task.")
+        return msg
+
+    if msg.get("type") == MESSAGE_TYPE_BINARY_INFO_REQUEST:
+        handle_binary_handshake_request(connection, master_ip_address, msg, config=config)
+        return None
+
+    raise ValueError(f"[BINARY] Unexpected message during initial handshake: {msg!r}")
 
 
 
@@ -273,11 +275,22 @@ def run_worker_task(
     """Handle ready message, fetch allocated part file, run execute_command, send finished signal, and upload result."""
     downloaded_path = None
     output_filepath = None
+    output_dir = Path(WORKER_OUTPUT_DIRECTORY)
+    uploaded_names: set[str] = set()
     try:
         if early_ready_msg:
             ready_message = early_ready_msg
         else:
-            ready_message = receive_ready_message(connection, timeout=600.0)
+            msg = receive_json_message(connection, timeout=600.0)
+            if msg.get("type") == "shutdown":
+                raise MasterShutdownError("Master sent shutdown signal")
+            if msg.get("type") == "binary_info_request":
+                handle_binary_handshake_request(connection, master_ip_address, msg, config=config)
+                ready_message = receive_ready_message(connection, timeout=600.0)
+            elif msg.get("type") == "ready":
+                ready_message = msg
+            else:
+                raise ValueError(f"Expected ready or binary_info_request, got: {msg!r}")
             
         file_transfer_port = ready_message["file_transfer_port"]
         execute_cmd = ready_message.get("execute_command", execute_command_template)
@@ -314,17 +327,45 @@ def run_worker_task(
         print(f"[STATUS] Task complete.")
 
         part_filename = Path(downloaded_path).name
-        output_filepath = Path(WORKER_OUTPUT_DIRECTORY) / part_filename
+        output_dir = Path(WORKER_OUTPUT_DIRECTORY)
 
         # Send finished signal to Master over control port BEFORE upload starts
         # This allows the master dashboard to show "Receiving Files" during the upload
         send_finished_message(connection, elapsed_time, part_filename)
 
-        # Phase 4 Task 4.1: Upload completed output file back to Master's per-node file-transfer daemon FIRST
-        if output_filepath.is_file():
-            print(f"\n[STATUS] Sending result file to master...")
-            upload_result_file(master_ip_address, file_transfer_port, str(output_filepath))
-            print(f"[STATUS] Sent result {part_filename} to master.")
+        # Phase 4 Task 4.1: Upload ALL files in the output directory to the master's
+        # per-node file-transfer daemon. This handles both the standard 1-in-1-out case
+        # (e.g. transcoding where output is named identically to the input part file)
+        # and multi-output cases (e.g. Blender rendering frame_0001.png, frame_0002.png …).
+        output_files = sorted(output_dir.iterdir()) if output_dir.is_dir() else []
+        uploaded_names = set()
+        if output_files:
+            print(f"\n[STATUS] Sending result file(s) to master...")
+            for out_file in output_files:
+                if out_file.is_file():
+                    upload_result_file(master_ip_address, file_transfer_port, str(out_file))
+                    uploaded_names.add(out_file.name)
+                    print(f"[STATUS] Sent result {out_file.name} to master.")
+
+        # Upload a zero-byte sentinel named after the part file so the master's
+        # file_received polling always finds its expected filename, even when the
+        # execute command produced differently-named outputs (e.g. blender frames).
+        if part_filename not in uploaded_names:
+            sentinel_dir = output_dir
+            sentinel_dir.mkdir(parents=True, exist_ok=True)
+            sentinel_path = sentinel_dir / part_filename
+            sentinel_path.write_bytes(b"")
+            try:
+                upload_result_file(master_ip_address, file_transfer_port, str(sentinel_path))
+                print(f"[STATUS] Sent completion sentinel {part_filename} to master.")
+            finally:
+                try:
+                    sentinel_path.unlink()
+                except Exception:
+                    pass
+
+        # Track primary output filepath for cleanup (the part-named file if it exists)
+        output_filepath = output_dir / part_filename
 
         print(f"{PROGRESS_FINISHED} for worker ({part_filename})")
     finally:
@@ -342,6 +383,13 @@ def run_worker_task(
                 if p.is_file():
                     p.unlink()
                     printlog(f"Cleaned up worker output part file: {output_filepath}")
+            except Exception:
+                pass
+        for fname in uploaded_names:
+            try:
+                p = output_dir / fname
+                if p.is_file():
+                    p.unlink()
             except Exception:
                 pass
 

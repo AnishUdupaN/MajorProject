@@ -399,12 +399,40 @@ def open_listening_socket(port: int) -> socket.socket:
     return listening_socket
 
 
+def safe_select_sockets(sockets: list[socket.socket], timeout: float = 0.5) -> list[socket.socket]:
+    """Safely select readable sockets, silently dropping closed or invalid sockets (fileno < 0)."""
+    valid = []
+    for s in sockets:
+        try:
+            if s is not None and getattr(s, "fileno", lambda: -1)() >= 0:
+                valid.append(s)
+        except Exception:
+            pass
+    if not valid:
+        return []
+    try:
+        readable, _, _ = select.select(valid, [], [], timeout)
+        return readable
+    except (ValueError, OSError):
+        readable = []
+        for s in valid:
+            try:
+                if s.fileno() >= 0:
+                    r, _, _ = select.select([s], [], [], 0.0)
+                    if r:
+                        readable.append(s)
+            except Exception:
+                pass
+        return readable
+
+
 def distribute_part_file_to_single_node(
     worker_ip_address: str,
     part_filename: str,
     connection: socket.socket,
     parts_directory: str,
     master_ip_address: str | None = None,
+    execute_command: str | None = None,
 ) -> FileTransferDaemon:
     """Start file-transfer daemon and send ready message to a single worker node."""
     daemon = start_file_transfer_daemon(
@@ -418,7 +446,7 @@ def distribute_part_file_to_single_node(
     reachable_master_ip = master_ip_address or get_local_ip_for_peer(worker_ip_address)
     printlog(f"{PROGRESS_SENDING_FILE} ({worker_ip_address}, {part_filename})")
     try:
-        send_ready_message(connection, reachable_master_ip, daemon.port)
+        send_ready_message(connection, reachable_master_ip, daemon.port, execute_command=execute_command)
         receive_file_received_message(connection)
     except (ConnectionError, OSError) as exc:
         printlog(f"[WARNING] Failed to receive file confirmation from {worker_ip_address}: {exc}")
@@ -431,10 +459,11 @@ def distribute_part_files_to_active_nodes(
     parts_directory: str,
     master_ip_address: str | None = None,
     dashboard: StatusDashboard | None = None,
+    config: Config | None = None,
 ) -> list[FileTransferDaemon]:
     """Start one file-transfer daemon per node and distribute part files in parallel."""
     daemons: list[FileTransferDaemon] = []
-    pending_transfers: list[tuple[str, str, socket.socket, str, int]] = []
+    pending_transfers: list[tuple[str, str, socket.socket, str, int, str | None]] = []
 
     for node_index, worker_ip_address in enumerate(active_nodes, start=1):
         part_filename = part_filename_for_node(node_index)
@@ -451,6 +480,9 @@ def distribute_part_files_to_active_nodes(
         reachable_master_ip = master_ip_address or get_local_ip_for_peer(
             worker_ip_address
         )
+        # Resolve the execute_command for this worker's OS
+        worker_os = worker_pool.worker_telemetry.get(worker_ip_address, {}).get("os_type")
+        execute_command = config.get_execute_command(worker_os) if config else None
         pending_transfers.append(
             (
                 worker_ip_address,
@@ -458,6 +490,7 @@ def distribute_part_files_to_active_nodes(
                 connection,
                 reachable_master_ip,
                 daemon.port,
+                execute_command,
             )
         )
 
@@ -467,6 +500,7 @@ def distribute_part_files_to_active_nodes(
         connection,
         reachable_master_ip,
         file_transfer_port,
+        execute_command,
     ) in pending_transfers:
         printlog(f"{PROGRESS_SENDING_FILE} ({worker_ip_address}, {part_filename})")
         if dashboard:
@@ -474,11 +508,11 @@ def distribute_part_files_to_active_nodes(
                 f"Sending {part_filename} to {worker_ip_address}", timeout_seconds=8
             )
         try:
-            send_ready_message(connection, reachable_master_ip, file_transfer_port)
+            send_ready_message(connection, reachable_master_ip, file_transfer_port, execute_command=execute_command)
         except (ConnectionError, OSError) as exc:
             printlog(f"[WARNING] Failed to send ready message to {worker_ip_address}: {exc}")
 
-    for worker_ip_address, part_filename, connection, _, _ in pending_transfers:
+    for worker_ip_address, part_filename, connection, _, _, _ in pending_transfers:
         try:
             receive_file_received_message(connection)
             if dashboard:
@@ -540,16 +574,22 @@ def handle_no_spare_nodes_recovery(
                 import termios
                 import tty
                 fd = sys.stdin.fileno()
-                old_settings = termios.tcgetattr(fd)
-                tty.setcbreak(fd)
+                if fd < 0:
+                    fd = None
+                else:
+                    old_settings = termios.tcgetattr(fd)
+                    tty.setcbreak(fd)
             except Exception:
                 fd = None
                 old_settings = None
 
         try:
             while True:
-                if fd is not None:
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
+                if fd is not None and fd >= 0:
+                    try:
+                        rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
+                    except (ValueError, OSError):
+                        rlist = []
                     if rlist:
                         char = sys.stdin.read(1).lower()
                         if char in ("k", "w", "r", "b"):
@@ -625,7 +665,10 @@ def handle_no_spare_nodes_recovery(
                     )
 
                 if sys.stdin.isatty():
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+                    try:
+                        rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+                    except (ValueError, OSError):
+                        rlist = []
                     if rlist:
                         char = sys.stdin.read(1).lower()
                         if char == "k":
@@ -647,12 +690,14 @@ def handle_no_spare_nodes_recovery(
 
                 spare_connection = worker_pool.get_connection(found_spare_ip)
                 printlog(f"[FAILOVER] Reusing existing split file {part_filename} for spare node {found_spare_ip}")
+                _spare_os = worker_pool.worker_telemetry.get(found_spare_ip, {}).get("os_type")
                 daemon = distribute_part_file_to_single_node(
                     found_spare_ip,
                     part_filename,
                     spare_connection,
                     parts_directory,
                     master_ip_address,
+                    execute_command=config.get_execute_command(_spare_os) if config else None,
                 )
                 return found_spare_ip, spare_connection, daemon
             else:
@@ -704,7 +749,7 @@ def handle_no_spare_nodes_recovery(
                     if a_ip != failed_ip and not t.get("exec_finished")
                 }
                 if socket_map:
-                    readable, _, _ = select.select(list(socket_map.keys()), [], [], 0.5)
+                    readable = safe_select_sockets(list(socket_map.keys()), 0.5)
                     for sock in readable:
                         a_ip = socket_map[sock]
                         t = active_tasks[a_ip]
@@ -760,12 +805,14 @@ def handle_no_spare_nodes_recovery(
                         connected=True,
                     )
 
+                _reassigned_os = worker_pool.worker_telemetry.get(reassigned_ip, {}).get("os_type")
                 daemon = distribute_part_file_to_single_node(
                     reassigned_ip,
                     part_filename,
                     reassigned_conn,
                     parts_directory,
                     master_ip_address,
+                    execute_command=config.get_execute_command(_reassigned_os) if config else None,
                 )
                 return reassigned_ip, reassigned_conn, daemon
 
@@ -819,7 +866,10 @@ def handle_no_spare_nodes_recovery(
                     )
 
                 if sys.stdin.isatty():
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+                    try:
+                        rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+                    except (ValueError, OSError):
+                        rlist = []
                     if rlist:
                         char = sys.stdin.read(1).lower()
                         if char == "k":
@@ -832,7 +882,7 @@ def handle_no_spare_nodes_recovery(
                     if a_ip != failed_ip and not t.get("exec_finished")
                 }
                 if socket_map:
-                    readable, _, _ = select.select(list(socket_map.keys()), [], [], 0.5)
+                    readable = safe_select_sockets(list(socket_map.keys()), 0.5)
                     for sock in readable:
                         a_ip = socket_map[sock]
                         t = active_tasks[a_ip]
@@ -878,7 +928,10 @@ def handle_no_spare_nodes_recovery(
                         )
 
                     if sys.stdin.isatty():
-                        rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+                        try:
+                            rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+                        except (ValueError, OSError):
+                            rlist = []
                         if rlist:
                             char = sys.stdin.read(1).lower()
                             if char == "k":
@@ -891,7 +944,7 @@ def handle_no_spare_nodes_recovery(
                         if a_ip != failed_ip and not t.get("exec_finished")
                     }
                     if socket_map:
-                        readable, _, _ = select.select(list(socket_map.keys()), [], [], 0.5)
+                        readable = safe_select_sockets(list(socket_map.keys()), 0.5)
                         for sock in readable:
                             a_ip = socket_map[sock]
                             t = active_tasks[a_ip]
@@ -908,8 +961,10 @@ def handle_no_spare_nodes_recovery(
                 updated_mapping = swap_device_ip(failed_ip, found_spare_ip)
                 printlog(f"[FAILOVER] Updated devices.json: {updated_mapping}")
                 spare_connection = worker_pool.get_connection(found_spare_ip)
+                _spare_os = worker_pool.worker_telemetry.get(found_spare_ip, {}).get("os_type")
                 daemon = distribute_part_file_to_single_node(
-                    found_spare_ip, part_filename, spare_connection, parts_directory, master_ip_address
+                    found_spare_ip, part_filename, spare_connection, parts_directory, master_ip_address,
+                    execute_command=config.get_execute_command(_spare_os) if config else None,
                 )
                 return found_spare_ip, spare_connection, daemon
             elif reassigned_ip:
@@ -925,8 +980,10 @@ def handle_no_spare_nodes_recovery(
                         reassigned_ip, f"node{node_index}", part_filename, "reassigned",
                         receiving=False, executing=False, sending=False, connected=True
                     )
+                _reassigned_os = worker_pool.worker_telemetry.get(reassigned_ip, {}).get("os_type")
                 daemon = distribute_part_file_to_single_node(
-                    reassigned_ip, part_filename, reassigned_conn, parts_directory, master_ip_address
+                    reassigned_ip, part_filename, reassigned_conn, parts_directory, master_ip_address,
+                    execute_command=config.get_execute_command(_reassigned_os) if config else None,
                 )
                 return reassigned_ip, reassigned_conn, daemon
 
@@ -1008,12 +1065,14 @@ def reassign_task_to_spare_node(
             )
 
         printlog(f"[FAILOVER] Reusing existing split file {part_filename} for spare node {spare_ip}")
+        _spare_os = worker_pool.worker_telemetry.get(spare_ip, {}).get("os_type")
         daemon = distribute_part_file_to_single_node(
             spare_ip,
             part_filename,
             spare_connection,
             parts_directory,
             master_ip_address,
+            execute_command=config.get_execute_command(_spare_os) if config else None,
         )
         return spare_ip, spare_connection, daemon
     else:
@@ -1090,10 +1149,15 @@ def monitor_worker_executions_and_collect_results(
             for ip, task in active_tasks.items()
             if not task["file_received"]
         }
-        readable, _, _ = select.select(list(socket_map.keys()), [], [], 0.5)
+        dead_socks = [s for s in socket_map if getattr(s, "fileno", lambda: -1)() < 0]
+        live_socks = [s for s in socket_map if s not in dead_socks]
+        readable = safe_select_sockets(live_socks, 0.5)
 
-        socks_to_check = [s for s in socket_map if has_buffered_message(s)]
+        socks_to_check = [s for s in live_socks if has_buffered_message(s)]
         for s in readable:
+            if s not in socks_to_check:
+                socks_to_check.append(s)
+        for s in dead_socks:
             if s not in socks_to_check:
                 socks_to_check.append(s)
 
@@ -1102,6 +1166,8 @@ def monitor_worker_executions_and_collect_results(
             task = active_tasks[ip]
 
             try:
+                if sock in dead_socks or getattr(sock, "fileno", lambda: -1)() < 0:
+                    raise ConnectionError("Worker control socket closed")
                 msg = receive_json_message(sock)
                 if msg.get("type") == "finished":
                     task["exec_finished"] = True
@@ -1157,12 +1223,14 @@ def monitor_worker_executions_and_collect_results(
                                 printlog(f"[RETRY FAILED] Node {ip} failed binary handshake.")
                                 continue
 
+                            _retry_os = worker_pool.worker_telemetry.get(ip, {}).get("os_type")
                             daemon = distribute_part_file_to_single_node(
                                 ip,
                                 part_filename,
                                 retry_conn,
                                 parts_directory,
                                 master_ip_address,
+                                execute_command=config.get_execute_command(_retry_os) if config else None,
                             )
                             active_daemons.append(daemon)
                             active_tasks[ip] = {
@@ -1490,8 +1558,11 @@ def run_master() -> None:
                         import termios
                         import tty
                         fd = sys.stdin.fileno()
-                        old_settings = termios.tcgetattr(fd)
-                        tty.setcbreak(fd)
+                        if fd < 0:
+                            fd = None
+                        else:
+                            old_settings = termios.tcgetattr(fd)
+                            tty.setcbreak(fd)
                     except Exception:
                         fd = None
                         old_settings = None
@@ -1515,8 +1586,11 @@ def run_master() -> None:
                                 dashboard.move_config_selection(1)
                             continue
                             
-                        if fd is not None:
-                            rlist, _, _ = select.select([fd], [], [], 0.5)
+                        if fd is not None and fd >= 0:
+                            try:
+                                rlist, _, _ = select.select([fd], [], [], 0.5)
+                            except (ValueError, OSError):
+                                rlist = []
                             if rlist:
                                 char = os.read(fd, 1).decode(errors="replace").lower()
                                 if char == "w":
@@ -1568,8 +1642,11 @@ def run_master() -> None:
                         import termios
                         import tty
                         fd = sys.stdin.fileno()
-                        old_settings = termios.tcgetattr(fd)
-                        tty.setcbreak(fd)
+                        if fd < 0:
+                            fd = None
+                        else:
+                            old_settings = termios.tcgetattr(fd)
+                            tty.setcbreak(fd)
                     except Exception:
                         fd = None
                         old_settings = None
@@ -1599,8 +1676,11 @@ def run_master() -> None:
                                     break
                             elif ans == "quit":
                                 sys.exit(0)
-                        elif fd is not None:
-                            rlist, _, _ = select.select([fd], [], [], 0.5)
+                        elif fd is not None and fd >= 0:
+                            try:
+                                rlist, _, _ = select.select([fd], [], [], 0.5)
+                            except (ValueError, OSError):
+                                rlist = []
                             if rlist:
                                 char = os.read(fd, 1).decode(errors="replace").lower()
                                 if char in ("y", "\n", "\r"):
@@ -1778,7 +1858,7 @@ def run_master() -> None:
                 )
 
             initial_daemons = distribute_part_files_to_active_nodes(
-                active_nodes, worker_pool, arguments.parts_directory, master_ip_address=arguments.master_ip, dashboard=dashboard
+                active_nodes, worker_pool, arguments.parts_directory, master_ip_address=arguments.master_ip, dashboard=dashboard, config=config
             )
             daemons.extend(initial_daemons)
             printlog("\nPhase 2 complete: split files distributed to all active workers.")
