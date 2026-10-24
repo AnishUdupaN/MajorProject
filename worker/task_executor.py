@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import socket
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -102,39 +103,52 @@ def run_worker_task(
         # Send finished signal to Master over control port BEFORE upload starts
         send_finished_message(connection, elapsed_time, part_filename)
 
-        # Upload ALL files in output directory to master daemon
-        output_files = (
-            sorted(output_dir.iterdir()) if output_dir.is_dir() else []
-        )
-        uploaded_names = set()
-        if output_files:
-            print("\n[STATUS] Sending result file(s) to master...")
-            for out_file in output_files:
-                if out_file.is_file():
-                    upload_result_file(
-                        master_ip_address, file_transfer_port, str(out_file)
-                    )
-                    uploaded_names.add(out_file.name)
-                    print(f"[STATUS] Sent result {out_file.name} to master.")
-
-        # Upload a zero-byte sentinel named after part file so master polling finds it
-        if part_filename not in uploaded_names:
-            sentinel_dir = output_dir
-            sentinel_dir.mkdir(parents=True, exist_ok=True)
-            sentinel_path = sentinel_dir / part_filename
-            sentinel_path.write_bytes(b"")
-            try:
-                upload_result_file(
-                    master_ip_address, file_transfer_port, str(sentinel_path)
-                )
+        # Upload the specific expected output file to master daemon.
+        # Only look for the file matching the input part name; uploading every
+        # file in the shared output_dir can cause cross-worker interference when
+        # multiple workers run on the same machine.
+        expected_output_path = output_dir / part_filename
+        if expected_output_path.is_file() and expected_output_path.stat().st_size > 0:
+            print(f"\n[STATUS] Sending result file to master: {part_filename}")
+            upload_result_file(
+                master_ip_address, file_transfer_port, str(expected_output_path)
+            )
+            uploaded_names.add(part_filename)
+            print(f"[STATUS] Sent result {part_filename} to master.")
+        else:
+            # Fall back: scan output_dir for any non-empty file and upload it
+            # under the expected part filename so the master receives a valid file.
+            fallback_file: Path | None = None
+            if output_dir.is_dir():
+                for candidate in sorted(output_dir.iterdir()):
+                    if candidate.is_file() and candidate.stat().st_size > 0:
+                        fallback_file = candidate
+                        break
+            if fallback_file is not None:
                 print(
-                    f"[STATUS] Sent completion sentinel {part_filename} to master."
+                    f"\n[STATUS] Expected output '{part_filename}' not found; "
+                    f"uploading '{fallback_file.name}' as '{part_filename}'."
                 )
-            finally:
+                # Upload under the expected name so the master daemon accepts it
+                renamed_path = output_dir / part_filename
+                shutil.copy2(str(fallback_file), str(renamed_path))
                 try:
-                    sentinel_path.unlink()
-                except Exception:
-                    pass
+                    upload_result_file(
+                        master_ip_address, file_transfer_port, str(renamed_path)
+                    )
+                    uploaded_names.add(part_filename)
+                    print(f"[STATUS] Sent result {part_filename} to master.")
+                finally:
+                    if renamed_path != fallback_file:
+                        try:
+                            renamed_path.unlink()
+                        except Exception:
+                            pass
+            else:
+                raise RuntimeError(
+                    f"execute_command produced no output file in {output_dir}. "
+                    f"Expected: {part_filename}"
+                )
 
         output_filepath = output_dir / part_filename
         print(f"{PROGRESS_FINISHED} for worker ({part_filename})")

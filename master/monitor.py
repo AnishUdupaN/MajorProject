@@ -40,10 +40,16 @@ def monitor_worker_executions_and_collect_results(
     active_tasks: dict[str, dict] = {}
     node_retries: dict[str, int] = {}
 
+    split_command = config.split_command if config else ""
+
     for node_index, worker_ip in enumerate(active_nodes, start=1):
         active_tasks[worker_ip] = {
             "node_index": node_index,
-            "part_filename": part_filename_for_node(node_index),
+            "part_filename": part_filename_for_node(
+                node_index,
+                split_command=split_command,
+                parts_directory=parts_directory,
+            ),
             "connection": worker_pool.get_connection(worker_ip),
             "start_time": time.time(),
             "exec_finished": False,
@@ -284,7 +290,7 @@ def monitor_worker_executions_and_collect_results(
                 expected_output_file = (
                     Path(MASTER_OUTPUT_DIRECTORY) / task["part_filename"]
                 )
-                if expected_output_file.is_file():
+                if expected_output_file.is_file() and expected_output_file.stat().st_size > 0:
                     task["file_received"] = True
                     printlog(
                         f"{PROGRESS_FINISHED} ({ip}, {task['part_filename']}) - result saved to {expected_output_file}"
