@@ -189,11 +189,26 @@ def monitor_worker_executions_and_collect_results(
 
                     retries = node_retries.get(ip, 0)
                     retry_succeeded = False
-                    if retries < 1:
-                        # 1 Retry attempt on the same node first
+
+                    # Only attempt same-node retry when no spare is immediately
+                    # available. If a spare is already connected and idle, skip
+                    # straight to failover so the monitoring loop is not blocked
+                    # for retry_timeout seconds waiting for a dead node.
+                    with worker_pool.lock:
+                        spare_available = any(
+                            spare_ip != ip
+                            and spare_ip not in active_tasks
+                            and spare_ip not in worker_pool.killed_ips
+                            and spare_ip in worker_pool.connections
+                            for spare_ip in spare_nodes
+                        ) if spare_nodes else False
+
+                    if retries < 1 and not spare_available:
+                        # 1 Retry attempt on the same node first (only when no
+                        # spare is ready — avoids a needless retry_timeout delay)
                         node_retries[ip] = retries + 1
                         printlog(
-                            f"\n[RETRY 1/1] Task for node{node_index} failed on {ip}. Attempting retry 1/1 on same node {ip}..."
+                            f"\n[RETRY 1/1] Task for node{node_index} failed on {ip}. No spare available; attempting retry 1/1 on same node {ip}..."
                         )
 
                         retry_conn = None

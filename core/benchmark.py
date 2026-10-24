@@ -54,7 +54,8 @@ def get_system_cpu_percent(interval: float = 0.1) -> float:
             def _read_stat():
                 with open("/proc/stat", "r") as f:
                     fields = [float(x) for x in f.readline().split()[1:]]
-                idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+                # fields[3] = idle. Do NOT add fields[4] (iowait).
+                idle = fields[3]
                 return idle, sum(fields)
 
             idle1, total1 = _read_stat()

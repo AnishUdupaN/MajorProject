@@ -205,31 +205,40 @@ class ProcessCpuTracker:
             if line.startswith("cpu "):
                 parts = [float(x) for x in line.split()[1:]]
                 total = sum(parts)
-                idle = parts[3] + (parts[4] if len(parts) > 4 else 0.0)
+                # parts[3] = idle only. Do NOT add parts[4] (iowait) —
+                # iowait is time waiting for I/O, not idle CPU; adding it
+                # makes the system appear less loaded than it actually is.
+                idle = parts[3]
                 return total, idle
         except Exception:
             pass
         return None
 
     def _read_proc_ticks(self) -> float | None:
-        """Return total process jiffies from /proc/<pid>/stat if available."""
+        """Return process CPU jiffies (utime+stime only) from /proc/<pid>/stat."""
         try:
             with open(f"/proc/{self.pid}/stat", "r") as f:
                 content = f.read()
             rparen_idx = content.rfind(")")
             if rparen_idx != -1:
-                fields = content[rparen_idx + 1 :].split()
+                fields = content[rparen_idx + 1:].split()
                 utime = float(fields[11])
                 stime = float(fields[12])
-                cutime = float(fields[13])
-                cstime = float(fields[14])
-                return utime + stime + cutime + cstime
+                # Do NOT include cutime/cstime (fields[13]/[14]): those are
+                # monotonically-accumulating totals for already-reaped children.
+                # Including them causes proc_diff to spike when a child exits,
+                # making process_cpu_pct overshoot and hiding real background load.
+                return utime + stime
         except Exception:
             pass
         return None
 
     def get_cpu_usage(self) -> tuple[float, float, float]:
-        """Return (system_cpu_pct, process_cpu_pct, background_cpu_pct)."""
+        """Return (system_cpu_pct, process_cpu_pct, background_cpu_pct).
+
+        All three values are expressed as a percentage of total CPU capacity
+        (i.e. averaged across all cores, 0–100 scale).
+        """
         now = time.time()
         dt = now - self.last_time
         self.last_time = now
@@ -251,8 +260,14 @@ class ProcessCpuTracker:
             if proc_ticks is not None and self._last_proc_ticks is not None:
                 proc_diff = proc_ticks - self._last_proc_ticks
                 if tot_diff > 0:
+                    # Do NOT clamp process_cpu_pct to 100%: on a multi-core
+                    # machine a busy task can legitimately exceed 100% of one
+                    # core (e.g. 4-core machine, task uses 2 cores → 50% of
+                    # total capacity).  Clamping at 100% would make
+                    # background_cpu_pct = max(0, sys-100) = 0 whenever the
+                    # task is heavy, permanently hiding background load.
                     process_cpu_pct = max(
-                        0.0, min(100.0, 100.0 * (proc_diff / tot_diff))
+                        0.0, 100.0 * (proc_diff / tot_diff)
                     )
             self._last_sys_ticks = sys_ticks
             self._last_proc_ticks = proc_ticks
@@ -273,6 +288,7 @@ class ProcessCpuTracker:
 
         background_cpu_pct = max(0.0, system_cpu_pct - process_cpu_pct)
         return system_cpu_pct, process_cpu_pct, background_cpu_pct
+
 
 
 def set_process_nice(pid: int, nice_value: int) -> bool:
